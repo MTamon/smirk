@@ -84,7 +84,7 @@ def crop_face(landmarks, scale=1.4, image_size=224):
     return estimate_transform('similarity', src_pts, dst_pts)
 
 
-def detect_and_crop(frame_bgr, need_blendshapes, image_size=224):
+def detect_and_crop(frame_bgr, need_blendshapes, mp_delegate, image_size=224):
     """Return (rgb_224 uint8 or None, blendshapes or None, mp_elapsed).
 
     When need_blendshapes is False this uses the lighter ``run_mediapipe``
@@ -92,14 +92,14 @@ def detect_and_crop(frame_bgr, need_blendshapes, image_size=224):
     """
     t0 = time.perf_counter()
     if need_blendshapes:
-        mp_result = run_mediapipe_full(frame_bgr)
+        mp_result = run_mediapipe_full(frame_bgr, delegate=mp_delegate)
         t_mp = time.perf_counter() - t0
         if mp_result is None:
             return None, None, t_mp
         landmarks = mp_result['landmarks'][..., :2]
         blendshapes = mp_result['blendshapes']
     else:
-        landmarks = run_mediapipe(frame_bgr)
+        landmarks = run_mediapipe(frame_bgr, delegate=mp_delegate)
         t_mp = time.perf_counter() - t0
         if landmarks is None:
             return None, None, t_mp
@@ -168,6 +168,11 @@ def main():
                              'Implies --crop (mediapipe must run per-frame).')
     parser.add_argument('--benchmark', action='store_true',
                         help='Measure and report per-stage timings + FPS.')
+    parser.add_argument('--mp_delegate', type=str, default='cpu',
+                        choices=['cpu', 'gpu'],
+                        help='MediaPipe Tasks inference delegate. GPU '
+                             'requires a MediaPipe build with OpenGL ES '
+                             'support; falls back to CPU on init failure.')
     args = parser.parse_args()
 
     if args.with_eye_pose and not args.crop:
@@ -227,6 +232,7 @@ def main():
         if args.crop:
             rgb_224, blendshapes, t_mp = detect_and_crop(
                 frame, need_blendshapes=args.with_eye_pose,
+                mp_delegate=args.mp_delegate,
             )
             t_mp_total += t_mp
             if rgb_224 is None:
@@ -292,17 +298,23 @@ def main():
     if args.benchmark:
         encode_fps = (len(per_frame_out) / t_encode_total) if t_encode_total > 0 else 0.0
         e2e_fps = (frame_count / t_total) if t_total > 0 else 0.0
+        mp_fps = (frame_count / t_mp_total) if t_mp_total > 0 else 0.0
         result['bench'] = {
             'total_seconds': t_total,
             'encode_seconds': t_encode_total,
             'mediapipe_seconds': t_mp_total,
             'encode_fps': encode_fps,
+            'mediapipe_fps': mp_fps,
             'end_to_end_fps': e2e_fps,
+            'mp_delegate': args.mp_delegate,
+            'encode_device': args.device,
         }
-        print(f'[bench] frames={frame_count}  valid={int(sum(valid_mask))}')
+        print(f'[bench] frames={frame_count}  valid={int(sum(valid_mask))}  '
+              f'mp_delegate={args.mp_delegate}  encode_device={args.device}')
         print(f'[bench] total={t_total:.2f}s  encode={t_encode_total:.2f}s  '
               f'mediapipe={t_mp_total:.2f}s')
-        print(f'[bench] encode_fps={encode_fps:.1f}  end_to_end_fps={e2e_fps:.1f}')
+        print(f'[bench] encode_fps={encode_fps:.1f}  mediapipe_fps={mp_fps:.1f}  '
+              f'end_to_end_fps={e2e_fps:.1f}')
 
     ext = os.path.splitext(args.out_path)[1].lower()
     if ext == '.npz':

@@ -84,12 +84,14 @@ def load_encoder(checkpoint_path, device):
     return encoder
 
 
-def draw_overlay(canvas_bgr, fps, mp_ms, enc_ms, ren_ms, face_ok, extras=None):
+def draw_overlay(canvas_bgr, fps, mp_ms, enc_ms, ren_ms, face_ok,
+                 mp_delegate='cpu', enc_device='cpu', extras=None):
     h, w = canvas_bgr.shape[:2]
     pad = 8
     lines = [
         f'FPS: {fps:5.1f}',
         f'mp:{mp_ms:5.1f}ms  enc:{enc_ms:5.1f}ms  ren:{ren_ms:5.1f}ms',
+        f'mp_delegate:{mp_delegate}  enc_device:{enc_device}',
         f'face: {"OK" if face_ok else "---"}',
     ]
     if extras:
@@ -141,6 +143,11 @@ def main():
                         help='Directory used for snapshot PNGs (key: s).')
     parser.add_argument('--window', type=str, default='SMIRK webcam',
                         help='OpenCV window title.')
+    parser.add_argument('--mp_delegate', type=str, default='cpu',
+                        choices=['cpu', 'gpu'],
+                        help='MediaPipe Tasks inference delegate. GPU '
+                             'requires a MediaPipe build with OpenGL ES '
+                             'support; falls back to CPU on init failure.')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
@@ -189,14 +196,14 @@ def main():
             # --- MediaPipe ---
             t_mp0 = time.perf_counter()
             if args.with_eye_pose:
-                mp_result = run_mediapipe_full(frame)
+                mp_result = run_mediapipe_full(frame, delegate=args.mp_delegate)
                 if mp_result is not None:
                     landmarks = mp_result['landmarks'][..., :2]
                     blendshapes = mp_result['blendshapes']
                 else:
                     landmarks, blendshapes = None, None
             else:
-                landmarks_full = run_mediapipe(frame)
+                landmarks_full = run_mediapipe(frame, delegate=args.mp_delegate)
                 landmarks = landmarks_full[..., :2] if landmarks_full is not None else None
                 blendshapes = None
             t_mp = (time.perf_counter() - t_mp0) * 1000.0
@@ -278,7 +285,11 @@ def main():
                     f'eyes_pose|L|≈{np.linalg.norm(eyes_pose_np[:6]):.2f}  '
                     f'blink L/R: {eyelids_np[0]:.2f}/{eyelids_np[1]:.2f}'
                 )
-            draw_overlay(canvas, avg_fps, t_mp, enc_ms, ren_ms, face_ok, extras)
+            draw_overlay(
+                canvas, avg_fps, t_mp, enc_ms, ren_ms, face_ok,
+                mp_delegate=args.mp_delegate, enc_device=str(device),
+                extras=extras,
+            )
 
             cv2.imshow(args.window, canvas)
             key = cv2.waitKey(1) & 0xFF
