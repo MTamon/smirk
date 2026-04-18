@@ -508,6 +508,41 @@ bash demos/run_demo_webcam.sh --capture_only
 モードで FPS が低ければ原因は **完全にカメラ or GUI 側** と確定できます
 （推論が追加されたときの FPS がこれ以下にしかならないのが理論上限）。
 
+### 2.6 結論: demo_webcam.py の推奨起動コマンド
+
+§2.4 / §2.4.1 / §2.4.2 の切り分け結果を踏まえた **現時点の推奨**:
+
+```bash
+# これでOK（Sunplus FHD で 30 fps 実測）
+bash demos/run_demo_webcam.sh
+```
+
+フラグ不要です。`run_demo_webcam.sh` 経由で起動するのは §A.5 の EGL 環境変数を
+自動でセットするため（MediaPipe GPU delegate を使う/使わないに関わらず推奨）。
+現デフォルトは以下の最小 `cap.set()` 構成に揃えてあります:
+
+- `--fourcc MJPG`（YUYV 5 fps 問題を回避）
+- `--width 1280 --height 720`
+- `CAP_PROP_BUFFERSIZE` は **触らない**（以前の 1 強制は halving の一因のため撤去）
+- `CAP_PROP_AUTO_EXPOSURE` は **触らない**（auto 再アサインが halving のもう一因のため撤去）
+- `--mp_delegate cpu`（GPU も warm なら同等 〜 §2.0）
+- レンダリング ON（`--no_render` で切れる）
+
+状況別のオプション上乗せ:
+
+| 状況 | 追加フラグ |
+|---|---|
+| 低遅延を優先したい（バックログに溜まった古いフレームを捨てたい） | `--capture_thread` |
+| 暗所で 10〜15 fps まで落ちる | **照明を足す** が第一。ソフト側では `--auto_exposure manual --exposure 200` で改善する環境もあるが、カメラファーム次第で効かない（§2.4.1） |
+| MediaPipe を GPU で回したい（長時間バッチや CPU が他で忙しいとき） | `--mp_delegate gpu` |
+| 推論スループットだけ測りたい | `--no_render` |
+| カメラ／表示パイプの I/O 上限だけ測りたい | `--capture_only` |
+| FPS が明らかに低く `cap.set` を疑いたい | `--minimal_cap`（全 `cap.set()` スキップ＝DECA 相当） |
+| 眼球向きも保存したい（FlashAvatar 用） | `--with_eye_pose [--save_path path.jsonl]` |
+
+デバッグに迷ったら **まず `--minimal_cap` で DECA 相当の素の挙動** を取って
+基準値を確定してから、必要な機能を 1 つずつ足していく流れが最短です。
+
 ---
 
 ## 3. 既知の制約 / トラブルシュート
