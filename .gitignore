@@ -8,5 +8,7 @@ assets/ResNet50
 assets/face_landmarker.task
 assets/LRS3_lists.pkl
 assets/MEAD_lists.pkl
+output/*
+!output/.gitkeep
 .vscode
 __pycache__/
