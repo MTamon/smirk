@@ -164,9 +164,49 @@ SMIRK 側単独で再現したもの。
 ## 2. MediaPipe GPU / CPU 切替
 
 **実装済み**。`--mp_delegate {cpu,gpu}` フラグで切り替わります。
-デフォルトは `cpu`（互換性維持）。
+デフォルトは `cpu`（互換性維持 & 実測で CPU の方が速いため、§2.1 参照）。
 
-### 実装の仕組み
+### 2.0 結論先出し: 本構成では CPU delegate が速い
+
+RTX 5090 + Ryzen/Intel 級の modern x86 + `cv2.VideoCapture → numpy`
+取り込みという今回の構成では、**CPU XNNPACK の方が GPU delegate より
+per-frame で 2–3 倍速い** ことを実測しました。`demo_save_flame.py --crop
+--benchmark` の `samples/dafoe.mp4` (99 frames, 1920x1080) での計測:
+
+| delegate | total | detect | encode | end_to_end_fps | mediapipe_fps |
+|---|---|---|---|---|---|
+| `cpu` | 0.89 s | **0.54 s** | 0.26 s | **111.9** | **176.3** |
+| `gpu` | 1.87 s | 1.54 s | 0.26 s | 52.8 | 63.5 |
+
+詳しくは §2.1 を参照。**`--mp_delegate gpu` は残してあるが常用は非推奨**で、
+以下のケースでのみ検討してください:
+
+- CPU が他ワークロード（例: DECA + FlashAvatar 同時走行）で埋まっている
+- 組み込み/モバイル CPU など XNNPACK の SIMD 恩恵が薄い環境
+- バッチで複数顔／複数モデルを 1 回の GPU 呼び出しで処理する将来拡張
+- カメラ→GL 直接取り込みができて upload コストを 0 にできる統合（MediaPipe の
+  `ImageFormat.GPU_BUFFER` 経路）
+
+### 2.1 なぜ GPU delegate が遅いのか
+
+MediaPipe Tasks の `face_landmarker.task` は軽量な MobileNet 派生モデル
+(~3 MB) です。GPU delegate を指定した場合、1 フレームごとに以下が発生します:
+
+1. numpy → GL テクスチャ **upload**（PCIe 往復、1920x1080 で ~2–3 ms）
+2. TFLite GPU delegate で推論（~2–3 ms）
+3. 478 landmark + 52 blendshape の **readback**（~1–2 ms）
+4. `FaceBlendshapesGraph` は仕様上 **常に CPU XNNPACK** なので、上記 readback 後に
+   blendshape を CPU で計算するため **二度目の GPU→CPU 転送が発生**
+
+合計 ~10–15 ms / frame。一方 CPU XNNPACK は AVX2/AVX-512 SIMD 直撃かつ
+PCIe 往復がゼロで ~5 ms / frame。モデルが小さいほど転送コストが相対的に
+支配的になるため、**小モデルでは GPU delegate が負ける** のが一般的です。
+
+これは MediaPipe / TFLite の既知挙動で、Google 公式ガイドでも
+「モバイル GPU やバッチ処理でない限り XNNPACK の方が速い可能性がある」
+と明記されています。
+
+### 2.2 実装の仕組み
 
 - `utils/mediapipe_utils.py` に `get_detector(delegate)` を追加。
   `python.BaseOptions(delegate=Delegate.GPU | Delegate.CPU)` で
@@ -179,7 +219,7 @@ SMIRK 側単独で再現したもの。
 - 既存呼び出し（`delegate=None`）はモジュールレベル CPU detector を
   使うため `demo.py` / `demo_video.py` / `smirk_trainer.py` は無改修。
 
-### CPU vs GPU 速度比較の取り方
+### 2.3 CPU vs GPU 速度比較の取り方
 
 **動画ファイル（`demo_save_flame.py`）**:
 

@@ -221,12 +221,16 @@ bash demos/run_demo_webcam.sh --source samples/dafoe.mp4 --no_render --mp_delega
 
 ### 期待される FPS のオーダー (RTX 5090 + Ubuntu 22.04)
 
-| 設定 | end_to_end_fps |
-|---|---|
-| MP cpu + SMIRK cuda, no_render, ideal-source | 80–120 |
-| MP gpu + SMIRK cuda, no_render, ideal-source | 100–180 |
-| MP gpu + SMIRK cuda, with render, webcam (30fps 上限) | 30 (カメラ律速) |
-| MP cpu + SMIRK cpu, no_render | 10–20 |
+以下は `demo_save_flame.py --crop --benchmark` に `samples/dafoe.mp4`
+(99 frames, 1920×1080) を流した **実測値**（2026-04-18, Blackwell sm_120 +
+modern x86）:
+
+| 設定 | total | detect | encode | end_to_end_fps | mediapipe_fps |
+|---|---|---|---|---|---|
+| MP **cpu** + SMIRK cuda | 0.89 s | **0.54 s** | 0.26 s | **111.9** | **176.3** |
+| MP **gpu** + SMIRK cuda | 1.87 s | 1.54 s | 0.26 s | 52.8 | 63.5 |
+
+→ **本構成では MP delegate は CPU の方が 2 倍以上速い**。詳しくは §6 参照。
 
 DECA 側でも同じオーダーに収束するはず（エンコーダが ResNet50 なので
 SMIRK より若干重いが、MobileNetV3 との差は cuDNN で吸収される）。
@@ -353,3 +357,95 @@ demos/
   ただし NVIDIA EGL は display 不要で動くので通常不要。
 - WSL2 環境 → WSLg の GL 実装が NVIDIA EGL を持たないので、GPU delegate は
   使えない。CPU XNNPACK で運用するしかない（cuDNN 側の SMIRK は別パスで動く）。
+
+---
+
+## 6. ★ MediaPipe delegate 選定の実測知見（FLARE / DECA / FlashAvatar 全てで重要）
+
+### 6.1 結論
+
+**本構成 (RTX 5090 + modern x86 + `cv2 → numpy` 取り込み) では MediaPipe の
+`--mp_delegate cpu`（XNNPACK）の方が `gpu` より 2–3 倍速い**。GPU delegate は
+実装自体は動作し、NVIDIA EGL でコンテキストも正常に張れるが、モデルサイズ
+が小さすぎて CPU↔GPU 転送コストが推論時間を上回る。
+
+### 6.2 実測データ (2026-04-18)
+
+- 入力: `samples/dafoe.mp4` (99 frames, 1920×1080, 24 fps)
+- コマンド: `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark --mp_delegate {cpu,gpu}`
+
+```
+# CPU delegate
+[bench] frames=99  valid=99  mp_delegate=cpu  encode_device=cuda
+[bench] total=0.89s  decode=0.04s  detect=0.54s  warp=0.02s  to_device=0.02s  encode=0.26s
+[bench] encode_fps=381.6  mediapipe_fps=176.3  end_to_end_fps=111.9
+
+# GPU delegate
+[bench] frames=99  valid=99  mp_delegate=gpu  encode_device=cuda
+[bench] total=1.87s  decode=0.04s  detect=1.54s  warp=0.02s  to_device=0.01s  encode=0.26s
+[bench] encode_fps=375.9  mediapipe_fps=63.5  end_to_end_fps=52.8
+```
+
+- `detect` 以外（decode / warp / to_device / encode）は両モードでほぼ同じ。
+- `detect/frame` は CPU=5.5 ms, GPU=15.5 ms。**GPU が約 2.8 倍遅い**。
+- SMIRK エンコーダ自体は両モードで `encode_fps≈380` (cuDNN, cudnn.benchmark)。
+  つまりエンコーダは全く頭打ちではなく、完全に MediaPipe detect 律速。
+
+### 6.3 なぜ GPU delegate が遅いか（分解）
+
+`face_landmarker.task` は軽量な MobileNet 派生 (~3 MB)。フレームごとに:
+
+1. numpy → GL テクスチャ **upload** (~2–3 ms, PCIe 往復, 1920×1080)
+2. TFLite GPU delegate で推論 (~2–3 ms)
+3. 478 landmark + 52 blendshape の **readback** (~1–2 ms)
+4. **`FaceBlendshapesGraph` は仕様上常に CPU XNNPACK 固定** なので、
+   readback 後に **二度目の GPU→CPU データ移動** が入る
+5. そもそも GL context の state sync コストがループごとに加算
+
+合計 ~10–15 ms / frame。CPU XNNPACK は AVX2/AVX-512 直撃 & PCIe 往復ゼロで
+~5 ms / frame。モデルが小さいほど転送コストの相対比が大きくなり、本ケースの
+ように完全に負ける。
+
+これは MediaPipe / TFLite の **既知挙動** で、Google 公式ガイドも
+「モバイル GPU や GL 経由のフレームソース以外では XNNPACK の方が速い
+可能性がある」と明記している。
+
+### 6.4 それでも GPU delegate を使うべきケース
+
+- **CPU が逼迫している環境**: DECA + FlashAvatar + SMIRK 同時走行で CPU が
+  オーバーサブスクライブしているとき、MediaPipe を GPU に逃がすと
+  CPU 側が楽になり、全体スループットが上がる可能性がある。
+- **組み込み / モバイル / クラウド低コア VM**: CPU が AVX-512 を持たない、
+  コア数が少ない環境では XNNPACK の旨味が消え、GPU delegate が勝ち得る。
+- **将来のバッチ化**: 1 フレームで複数顔 / 複数モデルを一括で GL 上に
+  常駐させて処理する拡張をするとき、upload コストが分散される。
+- **カメラ → GL 直接取り込み**: MediaPipe の `ImageFormat.GPU_BUFFER` 経路で
+  webcam / V4L2 → GL テクスチャを直接食わせられるなら、upload コストが 0 になり
+  逆転する可能性あり。ただし現在の `cv2.VideoCapture` + numpy 経路では不可。
+
+### 6.5 FLARE / DECA 側への指針
+
+- **デフォルトは CPU delegate**。これは SMIRK 側の現デフォルトと同じで、
+  `MTamon/FLARE` の extractor / `MTamon/DECA` の推論スクリプトでも同方針にする。
+- **GPU delegate を完全に削除しないこと**: 上記 6.4 のシナリオで復活させる
+  可能性があるため、`--mp_delegate` CLI フラグは残す。
+- **ベンチマークは両モード計測**: 新ハード (H100 / B200 / Grace Hopper) で
+  同じ SMIRK pipeline を走らせたときに逆転する可能性があるので、新環境では
+  `demo_save_flame.py --benchmark --mp_delegate {cpu,gpu}` の両方を走らせて
+  `.pt` の `bench` dict を比較する（`mediapipe_fps` の差が最重要指標）。
+- **統合ワークロード計測**: DECA + FlashAvatar + SMIRK を同じプロセスで
+  走らせた時の CPU 逼迫度を測って、GPU delegate が CPU 解放目的で有効か
+  判定する。単体ベンチではなく end-to-end での比較が必要。
+
+### 6.6 「設定は動いているが遅いだけ」を見分ける方法
+
+このセクションの現象は「GPU delegate が動作していない（CPU フォールバック）」
+とは別物です。見分け方:
+
+- **CPU フォールバック時**: stderr に `libEGL warning: MESA-LOADER: failed ...`
+  や `[mediapipe_utils] GPU delegate unavailable (...); falling back to CPU.`
+  のメッセージが出る → §5 の EGL ベンダ設定で解決。
+- **本セクションの現象（正しく GPU で動いているが遅い）**: 起動ログに
+  `[demos/_env.sh] EGL vendor pinned to NVIDIA: ...` が出て、MediaPipe 由来の
+  エラーは出ない。`.pt` の `bench['mp_delegate']` が `'gpu'` なのに `mediapipe_fps`
+  が CPU より低い → **設定は正しく、PCIe 律速の物理的な限界**。
