@@ -23,6 +23,16 @@ Optional features:
     --save_path     : append SMIRK (and optional eye-pose) parameters
                       per frame as JSON Lines to this file.
     --no_render     : skip the mesh render (SMIRK-only benchmark mode).
+    --capture_only  : skip MediaPipe + SMIRK + render entirely. Measures
+                      the I/O ceiling (cap.read + imshow + waitKey) so
+                      "is the camera the bottleneck?" can be answered
+                      independently of inference.
+    --fourcc MJPG   : pixel format requested from a UVC webcam. Defaults
+                      to MJPG — without this most USB 2.0 UVC cameras
+                      fall back to YUYV and cap cap.read() at ~5 fps
+                      even though the host can render far faster. The
+                      missing ~170ms/frame at 5 FPS is entirely the
+                      USB frame-arrival wait, not host-side processing.
 
 Controls:
     q : quit
@@ -78,13 +88,26 @@ def load_encoder(checkpoint_path, device):
     return encoder
 
 
-def draw_overlay(canvas_bgr, fps, mp_ms, enc_ms, ren_ms, face_ok,
+def draw_overlay(canvas_bgr, fps, timings, face_ok,
                  mp_delegate='cpu', enc_device='cpu', extras=None):
-    h, w = canvas_bgr.shape[:2]
+    """Overlay per-stage timings on the display canvas.
+
+    ``timings`` is a dict of stage-name -> milliseconds for the most
+    recent frame (``cap``, ``mp``, ``pre``, ``enc``, ``ren``, ``disp``,
+    ``gui`` are expected; missing keys render as ``---``).
+    """
     pad = 8
+
+    def t(k):
+        v = timings.get(k)
+        return '  --' if v is None else f'{v:5.1f}'
+
+    total = sum(v for v in timings.values() if v is not None)
     lines = [
-        f'FPS: {fps:5.1f}',
-        f'mp:{mp_ms:5.1f}ms  enc:{enc_ms:5.1f}ms  ren:{ren_ms:5.1f}ms',
+        f'FPS: {fps:5.1f}  total:{total:5.1f}ms',
+        f'cap:{t("cap")}  mp:{t("mp")}  pre:{t("pre")}',
+        f'enc:{t("enc")}  ren:{t("ren")}',
+        f'disp:{t("disp")}  gui:{t("gui")}',
         f'mp_delegate:{mp_delegate}  enc_device:{enc_device}',
         f'face: {"OK" if face_ok else "---"}',
     ]
@@ -132,11 +155,24 @@ def main():
                         help='Requested webcam capture width (webcam only).')
     parser.add_argument('--height', type=int, default=720,
                         help='Requested webcam capture height (webcam only).')
+    parser.add_argument('--fourcc', type=str, default='MJPG',
+                        help='Webcam pixel-format FOURCC. Most UVC cameras '
+                             'fall back to ~5 fps at 720p under the default '
+                             'YUYV because of USB 2.0 bandwidth; MJPG enables '
+                             'in-camera JPEG and restores ~30 fps. Use YUYV '
+                             'only if the camera does not support MJPG or you '
+                             'need uncompressed frames. Set to empty string '
+                             '("") to leave the driver default untouched.')
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
     parser.add_argument('--no_render', action='store_true',
                         help='Skip the FLAME mesh render (benchmark only).')
+    parser.add_argument('--capture_only', action='store_true',
+                        help='Skip MediaPipe + SMIRK + render entirely and '
+                             'only capture -> (optional resize) -> display. '
+                             'Used to measure the I/O ceiling (cap.read + '
+                             'imshow + waitKey) independent of inference.')
     parser.add_argument('--save_path', type=str, default=None,
                         help='Append per-frame params as NDJSON to this path.')
     parser.add_argument('--snapshot_dir', type=str, default='output',
@@ -157,11 +193,13 @@ def main():
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    encoder = load_encoder(args.checkpoint, device)
+    encoder = None
+    if not args.capture_only:
+        encoder = load_encoder(args.checkpoint, device)
 
     flame = None
     renderer = None
-    if not args.no_render:
+    if not args.no_render and not args.capture_only:
         # Lazy import so benchmark mode works without FLAME assets.
         from src.FLAME.FLAME import FLAME
         from src.renderer.renderer import Renderer
@@ -181,9 +219,26 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f'Could not open source: {source_handle!r}')
     if is_webcam:
+        # FOURCC must be set BEFORE width/height — V4L2 picks the format
+        # first, then negotiates resolution within what the format supports.
+        # Without MJPG, most UVC cams fall back to YUYV and clamp 720p to
+        # ~5 fps because USB 2.0 bandwidth cannot carry raw 1280x720@30.
+        if args.fourcc:
+            fourcc_val = cv2.VideoWriter_fourcc(*args.fourcc.upper())
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc_val)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    print(f'[demo_webcam] source={source_handle!r} mode={"webcam" if is_webcam else "ideal-video"}')
+        # Shrink the driver-side queue so cap.read() always returns the
+        # most recent frame instead of draining a backlog when processing
+        # lags. Silently ignored by drivers that do not honor it.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fourcc_str = ''.join(chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4)) if actual_fourcc else ''
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f'[demo_webcam] source={source_handle!r} mode={"webcam" if is_webcam else "ideal-video"}  '
+          f'fourcc={fourcc_str or "?"}  size={actual_w}x{actual_h}  reported_fps={actual_fps:.1f}')
 
     save_fp = None
     if args.save_path:
@@ -194,95 +249,100 @@ def main():
 
     fps_window = deque(maxlen=30)
     frame_idx = 0
-    # Aggregate (sum over all frames) for the final summary print.
-    agg_mp_s = 0.0
-    agg_enc_s = 0.0
-    agg_ren_s = 0.0
+    # Aggregate per-stage sums (seconds) for the final summary print.
+    agg = {'cap': 0.0, 'mp': 0.0, 'pre': 0.0, 'enc': 0.0,
+           'ren': 0.0, 'disp': 0.0, 'gui': 0.0}
     agg_face_ok = 0
+    first_frame_seconds = None
     t_run0 = time.perf_counter()
     print('[demo_webcam] q: quit, s: snapshot')
 
     try:
         while True:
             t_frame0 = time.perf_counter()
+            timings: dict[str, float] = {}
 
+            # --- Capture (cap.read + optional flip) ---
+            t_cap0 = time.perf_counter()
             ret, frame = cap.read()
             if not ret:
                 print('[demo_webcam] frame read failed / EOF')
                 break
             if is_webcam:
-                frame = cv2.flip(frame, 1)  # mirror only for live selfie view
+                frame = cv2.flip(frame, 1)
+            timings['cap'] = (time.perf_counter() - t_cap0) * 1000.0
             orig_h, orig_w = frame.shape[:2]
 
-            # --- MediaPipe ---
-            t_mp0 = time.perf_counter()
-            if args.with_eye_pose:
-                mp_result = run_mediapipe_full(frame, delegate=args.mp_delegate)
-                if mp_result is not None:
-                    landmarks = mp_result['landmarks'][..., :2]
-                    blendshapes = mp_result['blendshapes']
-                else:
-                    landmarks, blendshapes = None, None
-            else:
-                landmarks_full = run_mediapipe(frame, delegate=args.mp_delegate)
-                landmarks = landmarks_full[..., :2] if landmarks_full is not None else None
-                blendshapes = None
-            t_mp = (time.perf_counter() - t_mp0) * 1000.0
-
-            face_ok = landmarks is not None
-
-            enc_ms = 0.0
-            ren_ms = 0.0
+            face_ok = False
             mesh_img = None
             outputs = None
             eyes_pose_np = None
             eyelids_np = None
 
-            if face_ok:
-                cropped_bgr = fast_crop_face_bgr(frame, landmarks, scale=1.4, image_size=224)
-                cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
-                tensor = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-                tensor = tensor.to(device, non_blocking=True)
-
-                # --- SMIRK encode ---
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                t_enc0 = time.perf_counter()
-                with torch.no_grad():
-                    outputs = encoder(tensor)
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                enc_ms = (time.perf_counter() - t_enc0) * 1000.0
-
-                # --- Optional eye-pose supplementation ---
+            if not args.capture_only:
+                # --- MediaPipe ---
+                t_mp0 = time.perf_counter()
                 if args.with_eye_pose:
-                    ep, el = estimate_eye_pose_and_eyelid(blendshapes, device='cpu')
-                    eyes_pose_np = ep.squeeze(0).numpy()
-                    eyelids_np = el.squeeze(0).numpy()
+                    mp_result = run_mediapipe_full(frame, delegate=args.mp_delegate)
+                    if mp_result is not None:
+                        landmarks = mp_result['landmarks'][..., :2]
+                        blendshapes = mp_result['blendshapes']
+                    else:
+                        landmarks, blendshapes = None, None
+                else:
+                    landmarks_full = run_mediapipe(frame, delegate=args.mp_delegate)
+                    landmarks = landmarks_full[..., :2] if landmarks_full is not None else None
+                    blendshapes = None
+                timings['mp'] = (time.perf_counter() - t_mp0) * 1000.0
+                face_ok = landmarks is not None
 
-                # --- Render (optional) ---
-                if not args.no_render:
-                    t_ren0 = time.perf_counter()
-                    mesh_img = render_mesh(flame, renderer, outputs, device)
-                    ren_ms = (time.perf_counter() - t_ren0) * 1000.0
+                if face_ok:
+                    # --- Preprocess (warp + cvtColor + to-device transfer) ---
+                    t_pre0 = time.perf_counter()
+                    cropped_bgr = fast_crop_face_bgr(frame, landmarks, scale=1.4, image_size=224)
+                    cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
+                    tensor = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                    tensor = tensor.to(device, non_blocking=True)
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    timings['pre'] = (time.perf_counter() - t_pre0) * 1000.0
 
-                # --- Log ---
-                if save_fp is not None:
-                    record = {
-                        'frame': frame_idx,
-                        'wall_time': time.time(),
-                        'shape': outputs['shape'].detach().cpu().numpy().squeeze(0).tolist(),
-                        'exp': outputs['exp'].detach().cpu().numpy().squeeze(0).tolist(),
-                        'pose': outputs['pose'].detach().cpu().numpy().squeeze(0).tolist(),
-                        'cam': outputs['cam'].detach().cpu().numpy().squeeze(0).tolist(),
-                        'eyelid': outputs['eyelid'].detach().cpu().numpy().squeeze(0).tolist(),
-                    }
-                    if args.with_eye_pose and eyes_pose_np is not None:
-                        record['eyes_pose'] = eyes_pose_np.tolist()
-                        record['eyelids'] = eyelids_np.tolist()
-                    save_fp.write(json.dumps(record) + '\n')
+                    # --- SMIRK encode ---
+                    t_enc0 = time.perf_counter()
+                    with torch.no_grad():
+                        outputs = encoder(tensor)
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    timings['enc'] = (time.perf_counter() - t_enc0) * 1000.0
 
-            # --- Display ---
+                    if args.with_eye_pose:
+                        ep, el = estimate_eye_pose_and_eyelid(blendshapes, device='cpu')
+                        eyes_pose_np = ep.squeeze(0).numpy()
+                        eyelids_np = el.squeeze(0).numpy()
+
+                    # --- Render (optional) ---
+                    if not args.no_render:
+                        t_ren0 = time.perf_counter()
+                        mesh_img = render_mesh(flame, renderer, outputs, device)
+                        timings['ren'] = (time.perf_counter() - t_ren0) * 1000.0
+
+                    if save_fp is not None:
+                        record = {
+                            'frame': frame_idx,
+                            'wall_time': time.time(),
+                            'shape': outputs['shape'].detach().cpu().numpy().squeeze(0).tolist(),
+                            'exp': outputs['exp'].detach().cpu().numpy().squeeze(0).tolist(),
+                            'pose': outputs['pose'].detach().cpu().numpy().squeeze(0).tolist(),
+                            'cam': outputs['cam'].detach().cpu().numpy().squeeze(0).tolist(),
+                            'eyelid': outputs['eyelid'].detach().cpu().numpy().squeeze(0).tolist(),
+                        }
+                        if args.with_eye_pose and eyes_pose_np is not None:
+                            record['eyes_pose'] = eyes_pose_np.tolist()
+                            record['eyelids'] = eyelids_np.tolist()
+                        save_fp.write(json.dumps(record) + '\n')
+
+            # --- Display prep (resize + hstack + overlay) ---
+            t_disp0 = time.perf_counter()
             display_h = 480
             scale = display_h / orig_h
             webcam_disp = cv2.resize(frame, (int(orig_w * scale), display_h))
@@ -292,15 +352,10 @@ def main():
             else:
                 canvas = webcam_disp
 
-            t_frame = time.perf_counter() - t_frame0
-            fps_window.append(t_frame)
-            avg_fps = len(fps_window) / max(sum(fps_window), 1e-6)
-
-            agg_mp_s += t_mp / 1000.0
-            agg_enc_s += enc_ms / 1000.0
-            agg_ren_s += ren_ms / 1000.0
-            if face_ok:
-                agg_face_ok += 1
+            t_frame_pre_gui = time.perf_counter() - t_frame0
+            # FPS uses frame-over-frame wall time, so take it after gui
+            # below; here we still need an estimate for the overlay.
+            fps_estimate = len(fps_window) / max(sum(fps_window), 1e-6) if fps_window else 0.0
 
             extras = []
             if args.with_eye_pose and eyes_pose_np is not None:
@@ -309,13 +364,29 @@ def main():
                     f'blink L/R: {eyelids_np[0]:.2f}/{eyelids_np[1]:.2f}'
                 )
             draw_overlay(
-                canvas, avg_fps, t_mp, enc_ms, ren_ms, face_ok,
+                canvas, fps_estimate, timings, face_ok,
                 mp_delegate=args.mp_delegate, enc_device=str(device),
                 extras=extras,
             )
+            timings['disp'] = (time.perf_counter() - t_disp0) * 1000.0
 
+            # --- GUI (imshow + waitKey) ---
+            t_gui0 = time.perf_counter()
             cv2.imshow(args.window, canvas)
             key = cv2.waitKey(1) & 0xFF
+            timings['gui'] = (time.perf_counter() - t_gui0) * 1000.0
+
+            t_frame = time.perf_counter() - t_frame0
+            fps_window.append(t_frame)
+
+            if first_frame_seconds is None:
+                first_frame_seconds = t_frame
+            else:
+                for k, v in timings.items():
+                    agg[k] += v / 1000.0
+            if face_ok:
+                agg_face_ok += 1
+
             if key == ord('q'):
                 break
             if key == ord('s'):
@@ -332,13 +403,25 @@ def main():
             save_fp.close()
         t_run = time.perf_counter() - t_run0
         e2e_fps = (frame_idx / t_run) if t_run > 0 else 0.0
-        def _avg_ms(total_s): return (1000.0 * total_s / frame_idx) if frame_idx else 0.0
+        # Averages exclude the first frame (cuDNN autotune, MediaPipe JIT,
+        # webcam auto-exposure ramp, first FLAME/Renderer allocation).
+        bench_frames = max(0, frame_idx - 1)
+
+        def _avg_ms(key):
+            return (1000.0 * agg[key] / bench_frames) if bench_frames else 0.0
+
+        stages = ('cap', 'mp', 'pre', 'enc', 'ren', 'disp', 'gui')
+        measured_sum_ms = sum(_avg_ms(k) for k in stages)
+        first_ms = (first_frame_seconds * 1000.0) if first_frame_seconds is not None else 0.0
         print(f'[demo_webcam] processed {frame_idx} frames in {t_run:.2f}s '
               f'(valid={agg_face_ok}, end_to_end_fps={e2e_fps:.1f})')
-        print(f'[demo_webcam] avg-per-frame  mp={_avg_ms(agg_mp_s):.1f}ms  '
-              f'enc={_avg_ms(agg_enc_s):.1f}ms  ren={_avg_ms(agg_ren_s):.1f}ms  '
-              f'mp_delegate={args.mp_delegate}  enc_device={str(device)}  '
-              f'mode={"webcam" if is_webcam else "ideal-video"}')
+        print(f'[demo_webcam] first-frame cost (excluded from averages): {first_ms:.1f}ms')
+        print('[demo_webcam] avg-per-frame  ' + '  '.join(
+            f'{k}={_avg_ms(k):.1f}ms' for k in stages
+        ) + f'  (sum={measured_sum_ms:.1f}ms)')
+        print(f'[demo_webcam] mp_delegate={args.mp_delegate}  enc_device={str(device)}  '
+              f'mode={"webcam" if is_webcam else "ideal-video"}  '
+              f'capture_only={args.capture_only}')
 
 
 if __name__ == '__main__':

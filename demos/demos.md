@@ -320,6 +320,89 @@ EGL/GL ドライバ次第** です。NVIDIA EGL vendor を明示する
 
 ---
 
+## 2.4 Web カメラの FPS が極端に低い（5 FPS など）場合
+
+`demo_webcam.py` を起動したら **FPS=5.0** に張り付いているが、オーバーレイの
+`mp:` / `enc:` / `ren:` 合計は 5 ms 前後しかない、という現象が起きたら
+**ほぼ 100% UVC USB カメラの FOURCC が YUYV になっている** のが原因です。
+
+- USB 2.0 の帯域は 480 Mbps。YUYV は 16 bit/pixel 非圧縮なので
+  1280×720×16 bit×30 fps ≒ 442 Mbps となり、実運用ではカメラファームが
+  **自動で 5 fps まで落とす**（USB isoch 転送のペイロードに収まらないため）。
+- MediaPipe/SMIRK/Renderer の処理時間は実は 5 ms/frame で完了している。
+  残り 195 ms は全部 `cv2.VideoCapture.read()` が「次の YUYV フレームが USB
+  経由で届くまでの待ち時間」を blocking している。
+- MJPG フォーマットをカメラに要求するとカメラ内 JPEG エンコーダが走り、
+  1 frame あたり ~50–100 KB に圧縮されるので 30 fps が余裕で収まる。
+
+本ブランチの `demo_webcam.py` は **デフォルトで `--fourcc MJPG` を指定**
+するので、再起動するだけで 30 FPS 近くに戻るはずです。明示指定も可:
+
+```bash
+bash demos/run_demo_webcam.sh --fourcc MJPG          # 既定
+bash demos/run_demo_webcam.sh --fourcc YUYV          # 比較用 (遅い)
+bash demos/run_demo_webcam.sh --fourcc ''            # V4L2 デフォルト
+```
+
+起動ログの 1 行目に必ず次が出ます:
+
+```
+[demo_webcam] source=0 mode=webcam  fourcc=MJPG  size=1280x720  reported_fps=30.0
+```
+
+`fourcc=YUYV` と出ている場合はカメラが MJPG を非サポート、もしくは V4L2
+ドライバが FOURCC 要求を無視しています。下記で確認:
+
+```bash
+v4l2-ctl -d /dev/video0 --list-formats-ext     # カメラ側の対応フォーマット
+```
+
+### 2.5 per-stage 計測と capture_only モード
+
+`demo_webcam.py` は 1 フレームを 7 ステージに分解して計測し、画面オーバーレイ
+と終了時サマリに出します:
+
+| stage | 内容 |
+|---|---|
+| `cap` | `cap.read()` + `cv2.flip` (webcam の鏡映) |
+| `mp` | MediaPipe FaceLandmarker 推論 |
+| `pre` | `fast_crop_face_bgr` + `cvtColor` + `torch.from_numpy` + `.to(device)` |
+| `enc` | SMIRK エンコーダ推論 (`torch.cuda.synchronize` 込み) |
+| `ren` | FLAME + Renderer (mesh を RGB 画像化) |
+| `disp` | `cv2.resize` + `np.hstack` + `draw_overlay` |
+| `gui` | `cv2.imshow` + `cv2.waitKey(1)` |
+
+終了時に出る例:
+
+```
+[demo_webcam] processed 400 frames in 13.58s (valid=400, end_to_end_fps=29.5)
+[demo_webcam] first-frame cost (excluded from averages): 1234.7ms
+[demo_webcam] avg-per-frame  cap=27.8ms  mp=4.9ms  pre=0.3ms  enc=2.9ms  ren=1.8ms  disp=0.7ms  gui=1.5ms  (sum=39.9ms)
+```
+
+**ポイント**:
+
+- `cap` が 27 ms 前後なのはカメラ実 FPS 30 の逆数 (33 ms) に近ければ正常。
+  これが 150–200 ms 台なら FOURCC YUYV 問題（§2.4）、または USB バスに他
+  カメラがぶら下がって帯域を食っている。
+- `gui`（imshow + waitKey）は X11/Qt 経路でそれなりに時間を食う場合がある。
+  Weston / Wayland 上の Qt 5 では稀に 10–30 ms。
+- `first-frame cost` は cuDNN autotune + MediaPipe TFLite 初期化 + Webcam
+  auto-exposure ランプ + FLAME/Renderer の初回 GL/CUDA アロケーションの合計。
+  定常 FPS にはカウントされない。
+
+**推論なしでカメラ→表示のパイプラインだけ測る**（純粋な I/O 上限）:
+
+```bash
+bash demos/run_demo_webcam.sh --capture_only
+```
+
+`mp` / `pre` / `enc` / `ren` はゼロ、`cap` / `disp` / `gui` のみ計測。この
+モードで FPS が低ければ原因は **完全にカメラ or GUI 側** と確定できます
+（推論が追加されたときの FPS がこれ以下にしかならないのが理論上限）。
+
+---
+
 ## 3. 既知の制約 / トラブルシュート
 
 | 症状 | 原因 | 対処 |
@@ -329,6 +412,8 @@ EGL/GL ドライバ次第** です。NVIDIA EGL vendor を明示する
 | FLAME ロードで `KeyError: 'v_template'` | FLAME2020.zip の解凍に失敗 | `rm -rf assets/FLAME2020 && bash prepare_demos.sh` |
 | `torch.load` で `UnpicklingError: weights_only` | PyTorch 2.4+ の既定値変化 | 本ブランチで `weights_only=False` を明示済み。外部のパッチに注意 |
 | `demo_webcam.py` ウィンドウが出ない | ヘッドレス環境で X11 なし | `--no_render` ＋ ベンチ用途で使う |
+| `demo_webcam.py` が 5 FPS に張り付く | UVC USB カメラが YUYV にフォールバック (USB 2.0 帯域不足) | デフォルト `--fourcc MJPG` のまま起動。§2.4 参照 |
+| `demo_webcam.py` 起動時の初回 1 秒が重い | cuDNN autotune + MP TFLite 初期化 + カメラ AE ランプ | 1 フレーム目だけの一時的コスト (サマリで first-frame cost 表示) |
 | GPU delegate が効かない（モニター直結） | MESA DRI が探索されて失敗 | **シェルラッパ経由で起動**（`bash demos/run_demo_webcam.sh ...`）|
 | GPU delegate が効かない（SSH越し） | DISPLAY 未設定＋NVIDIA EGL JSON 欠落 | `ls /usr/share/glvnd/egl_vendor.d/10_nvidia.json` を確認 |
 | `demos/_env.sh` の WARN メッセージ | NVIDIA driver の `libglvnd-egl` パッケージ不足 | `sudo apt install libnvidia-gl-<ver>` |
