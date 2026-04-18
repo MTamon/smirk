@@ -1,6 +1,8 @@
 logs/
 trained_models/
+!trained_models/.gitkeep
 pretrained_models/
+!pretrained_models/.gitkeep
 assets/expression_templates_famos
 assets/FLAME2020
 assets/mica.tar
