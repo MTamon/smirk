@@ -393,6 +393,52 @@ bash demos/run_demo_webcam.sh --auto_exposure manual --exposure -6
 別ツールで露光を固定してから demo を起動、または `v4l-utils` を入れて
 `v4l2-ctl --set-ctrl=exposure_auto=1 --set-ctrl=exposure_absolute=200`）。
 
+### 2.4.2 MJPG にしても 15 fps で張り付き、AE 関係ない場合（cap.set 副作用）
+
+以下の全条件が揃う状況では、原因は露光ではなく **OpenCV 側の V4L2 経路
+で `cap.set()` が悪さをしている** ことがほぼ確定です:
+
+- `--fourcc MJPG` 指定済みで、ログに `fourcc=MJPG reported_fps=30.0` が出ている
+- `--auto_exposure manual --exposure 200` 相当を入れても 15 fps のまま
+- 照明を明るくしても暗くしても FPS が変わらない
+- 同じカメラを `ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 -i /dev/video0 ...` で回すと **30 fps 出る**
+- 同じカメラで DECA の `demo_webcam.py`（`cap.set()` を一切呼ばない）を
+  起動すると **35 fps 近く出る**
+
+これは OpenCV の V4L2 backend 実装に含まれる既知のクセで、
+`CAP_PROP_BUFFERSIZE=1` や `CAP_PROP_AUTO_EXPOSURE` への再アサインが
+UVC コントロールストリームの再ネゴシエーションを誘発し、
+cap.read() が 1 フレーム毎に buffer flip を待つようになり **実効 FPS が
+ちょうど半分（30 → 15）** に落ちる、というものです。切り分けと回避のため
+本ブランチの `demo_webcam.py` には 3 つのフラグを用意しています:
+
+| フラグ | 挙動 |
+|---|---|
+| `--minimal_cap` | `cap.set()` を **一切呼ばず** にカメラを開く。DECA の demo と同じ構成で、まずこれで 30 fps 近くに戻るかを確認する最速のテスト手段 |
+| `--buffersize N` | 以前デフォルトで `1` に強制していた `CAP_PROP_BUFFERSIZE` を **ユーザ指定時のみ設定** に変更。未指定ならドライバ既定のまま（通常 4）。1 を試すのはパイプラインが明らかに camera cadence より速く、かつ遅延を短くしたいときだけ |
+| `--capture_thread` | `cap.read()` をバックグラウンドスレッドで常時走らせ、メインループは最新フレームだけ拾う。FOURCC や BUFFERSIZE を維持したまま halving を回避できる（複合原因のときの保険） |
+
+推奨の切り分け手順:
+
+```bash
+# 1) まず最小構成で 30fps 近くに戻るか確認
+bash demos/run_demo_webcam.sh --minimal_cap
+
+# 2) 戻ったら、どの cap.set() が犯人かを bisect
+bash demos/run_demo_webcam.sh                        # 現状 (デフォルト設定)
+bash demos/run_demo_webcam.sh --fourcc ''            # FOURCC 設定を外す
+bash demos/run_demo_webcam.sh                        #  (BUFFERSIZE は既定で未設定)
+
+# 3) 全部残したまま halving だけ避けたいとき
+bash demos/run_demo_webcam.sh --capture_thread
+```
+
+**注**: 以前のリビジョンではデフォルトで `CAP_PROP_BUFFERSIZE=1` と
+`CAP_PROP_AUTO_EXPOSURE=3 (auto 再アサイン)` を呼んでいましたが、この
+halving の原因に該当するため **どちらもデフォルトから外し** ました。
+低遅延が必要で backlog drain を抑えたい場合は `--buffersize 1 --capture_thread`
+のように明示併用してください。
+
 ### 2.5 per-stage 計測と capture_only モード
 
 `demo_webcam.py` は 1 フレームを 7 ステージに分解して計測し、画面オーバーレイ
@@ -449,6 +495,7 @@ bash demos/run_demo_webcam.sh --capture_only
 | `torch.load` で `UnpicklingError: weights_only` | PyTorch 2.4+ の既定値変化 | 本ブランチで `weights_only=False` を明示済み。外部のパッチに注意 |
 | `demo_webcam.py` ウィンドウが出ない | ヘッドレス環境で X11 なし | `--no_render` ＋ ベンチ用途で使う |
 | `demo_webcam.py` が 5 FPS に張り付く | UVC USB カメラが YUYV にフォールバック (USB 2.0 帯域不足) | デフォルト `--fourcc MJPG` のまま起動。§2.4 参照 |
+| `demo_webcam.py` が 15 FPS で張り付き、AE を切っても治らない | OpenCV V4L2 の `cap.set()` 副作用で cap.read() が buffer flip を毎回待つ。DECA demo なら 30+ fps 出る | `--minimal_cap` で最小構成に戻す / `--capture_thread` で回避。§2.4.2 参照 |
 | `demo_webcam.py` 起動時の初回 1 秒が重い | cuDNN autotune + MP TFLite 初期化 + カメラ AE ランプ | 1 フレーム目だけの一時的コスト (サマリで first-frame cost 表示) |
 | GPU delegate が効かない（モニター直結） | MESA DRI が探索されて失敗 | **シェルラッパ経由で起動**（`bash demos/run_demo_webcam.sh ...`）|
 | GPU delegate が効かない（SSH越し） | DISPLAY 未設定＋NVIDIA EGL JSON 欠落 | `ls /usr/share/glvnd/egl_vendor.d/10_nvidia.json` を確認 |

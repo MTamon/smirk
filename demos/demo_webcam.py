@@ -58,6 +58,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from collections import deque
 
@@ -120,6 +121,61 @@ def draw_overlay(canvas_bgr, fps, timings, face_ok,
         cv2.putText(canvas_bgr, line, (pad, y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (20, 240, 20), 1, cv2.LINE_AA)
     return canvas_bgr
+
+
+class CaptureThread:
+    """Background thread that pulls frames from cv2.VideoCapture.
+
+    On some OpenCV V4L2 builds the main-loop ``cap.read()`` halves the
+    effective FPS because MJPG CPU decode + imshow/waitKey overlap with
+    the camera's ISO-cadence; the driver keeps the next frame queued
+    while cv2 is busy. Running cap.read() in its own thread lets the
+    driver drain continuously, and the main loop just grabs whatever
+    the latest decoded frame is. DECA's webcam demo benefits from the
+    same pattern implicitly because its per-frame work is so small.
+    """
+
+    def __init__(self, cap):
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._latest = None
+        self._seq = 0
+        self._stop = False
+        self._last_seq_read = 0
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop:
+            ok, frame = self._cap.read()
+            if not ok:
+                with self._lock:
+                    self._error = 'cap.read() returned False'
+                break
+            with self._lock:
+                self._latest = frame
+                self._seq += 1
+
+    def read(self, timeout=2.0):
+        deadline = time.perf_counter() + timeout
+        while True:
+            with self._lock:
+                if self._error is not None:
+                    return False, None
+                if self._latest is not None and self._seq != self._last_seq_read:
+                    self._last_seq_read = self._seq
+                    return True, self._latest
+            if time.perf_counter() > deadline:
+                return False, None
+            time.sleep(0.001)
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=1.0)
 
 
 def render_mesh(flame, renderer, outputs, device):
@@ -186,6 +242,28 @@ def main():
                              'otherwise. Use when the startup log shows a '
                              'reported_fps lower than the camera spec and you '
                              'want to force negotiation to a higher mode.')
+    parser.add_argument('--buffersize', type=int, default=None,
+                        help='cv2.CAP_PROP_BUFFERSIZE. Default is to leave the '
+                             'driver default (usually 4). Setting 1 is '
+                             'tempting (latest frame only) but on some V4L2 '
+                             'builds it halves the effective FPS by forcing '
+                             'cap.read() to wait for each buffer flip.')
+    parser.add_argument('--capture_thread', action='store_true',
+                        help='Run cap.read() in a dedicated background thread '
+                             'so the main loop always receives the most recent '
+                             'decoded frame without blocking. Fixes the classic '
+                             "cv2 V4L2 + MJPG halving (camera delivers 30 fps "
+                             'but cv2 in-loop cap.read() retrieves every other '
+                             'frame because MJPG CPU decode + imshow/waitKey '
+                             'overlap with the camera cadence).')
+    parser.add_argument('--minimal_cap', action='store_true',
+                        help='Skip every cap.set() call (FOURCC, W/H, '
+                             'BUFFERSIZE, AUTO_EXPOSURE, FPS). Opens the '
+                             'camera exactly like DECA/demo_webcam does, with '
+                             'driver defaults. Useful to bisect which cap.set '
+                             'call is hurting a given camera. Overrides '
+                             '--fourcc, --width, --height, --camera_fps, '
+                             '--buffersize, --auto_exposure, --exposure.')
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
@@ -241,7 +319,7 @@ def main():
     cap = cv2.VideoCapture(source_handle)
     if not cap.isOpened():
         raise RuntimeError(f'Could not open source: {source_handle!r}')
-    if is_webcam:
+    if is_webcam and not args.minimal_cap:
         # FOURCC must be set BEFORE width/height — V4L2 picks the format
         # first, then negotiates resolution within what the format supports.
         # Without MJPG, most UVC cams fall back to YUYV and clamp 720p to
@@ -253,15 +331,18 @@ def main():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         if args.camera_fps is not None:
             cap.set(cv2.CAP_PROP_FPS, args.camera_fps)
-        # Shrink the driver-side queue so cap.read() always returns the
-        # most recent frame instead of draining a backlog when processing
-        # lags. Silently ignored by drivers that do not honor it.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        # Auto-exposure handling. In dim rooms UVC cameras extend
-        # exposure time, which caps FPS at 1/exposure_seconds (e.g.
-        # 66ms -> 15 fps). Switch to manual + short exposure to lift
-        # that ceiling. V4L2 magic numbers: 1 = manual, 3 = aperture
-        # priority (auto); some MSMF builds use 0.25 / 0.75 instead.
+        # Only touch BUFFERSIZE when the user explicitly asks: setting 1
+        # looks sensible (latest frame only) but on several V4L2 builds
+        # it forces cap.read() to wait for a buffer flip every call and
+        # halves the effective FPS (camera delivers 30fps, loop sees 15).
+        if args.buffersize is not None:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, args.buffersize)
+        # Auto-exposure handling. V4L2 magic numbers: 1 = manual,
+        # 3 = aperture priority (auto). We only call cap.set() for
+        # manual mode; re-asserting auto mode is a no-op at best and
+        # on some drivers re-negotiates the UVC control stream and
+        # drops the reported frame rate, so leave the camera default
+        # untouched when --auto_exposure auto.
         if args.auto_exposure == 'manual':
             ok1 = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
             if args.exposure is not None:
@@ -271,8 +352,9 @@ def main():
             if not (ok1 and ok2):
                 print('[demo_webcam] WARN: cap.set for exposure returned False; '
                       'driver may have ignored it.')
-        else:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
+    elif is_webcam and args.minimal_cap:
+        print('[demo_webcam] --minimal_cap: skipping every cap.set() call '
+              '(driver defaults only).')
     actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
     fourcc_str = ''.join(chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4)) if actual_fourcc else ''
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -287,6 +369,11 @@ def main():
         exp_val = cap.get(cv2.CAP_PROP_EXPOSURE)
         print(f'[demo_webcam] auto_exposure_ctrl={ae_val}  exposure_ctrl={exp_val}  '
               f'(requested: auto_exposure={args.auto_exposure}, exposure={args.exposure})')
+
+    capture_thread = None
+    if is_webcam and args.capture_thread:
+        capture_thread = CaptureThread(cap).start()
+        print('[demo_webcam] --capture_thread: background thread draining cap.read()')
 
     save_fp = None
     if args.save_path:
@@ -312,7 +399,10 @@ def main():
 
             # --- Capture (cap.read + optional flip) ---
             t_cap0 = time.perf_counter()
-            ret, frame = cap.read()
+            if capture_thread is not None:
+                ret, frame = capture_thread.read()
+            else:
+                ret, frame = cap.read()
             if not ret:
                 print('[demo_webcam] frame read failed / EOF')
                 break
@@ -445,6 +535,8 @@ def main():
 
             frame_idx += 1
     finally:
+        if capture_thread is not None:
+            capture_thread.stop()
         cap.release()
         cv2.destroyAllWindows()
         if save_fp is not None:
