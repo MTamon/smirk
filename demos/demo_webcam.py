@@ -233,7 +233,12 @@ def main():
                              '100us units (e.g. 200 -> 20ms exposure -> 50 '
                              'fps ceiling). On Windows MSMF/DSHOW it is '
                              'log2-scaled (try -6 .. -4). Ignored unless '
-                             '--auto_exposure manual.')
+                             '--auto_exposure manual. Note: some UVC cams '
+                             '(e.g. Sunplus FHD) will accept the value '
+                             '(echoed back by exposure_ctrl readback) yet '
+                             'still stretch the actual integration time in '
+                             'dim scenes, so FPS can still drop. Check the '
+                             'startup log and confirm by shining a light.')
     parser.add_argument('--camera_fps', type=float, default=None,
                         help='Request a target frame rate from the camera via '
                              'cv2.CAP_PROP_FPS. Most UVC drivers honor it if '
@@ -245,9 +250,13 @@ def main():
     parser.add_argument('--buffersize', type=int, default=None,
                         help='cv2.CAP_PROP_BUFFERSIZE. Default is to leave the '
                              'driver default (usually 4). Setting 1 is '
-                             'tempting (latest frame only) but on some V4L2 '
-                             'builds it halves the effective FPS by forcing '
-                             'cap.read() to wait for each buffer flip.')
+                             'tempting (latest frame only) but on several V4L2 '
+                             'builds it drops the effective FPS by ~30 percent '
+                             '(measured 30 -> 20 fps on Sunplus FHD) because '
+                             'cap.read() waits for a buffer flip every call. '
+                             'Combined with AUTO_EXPOSURE re-assert it drops '
+                             'to 15 fps (the classic halving). Prefer '
+                             '--capture_thread for low-latency instead.')
     parser.add_argument('--capture_thread', action='store_true',
                         help='Run cap.read() in a dedicated background thread '
                              'so the main loop always receives the most recent '

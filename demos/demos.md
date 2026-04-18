@@ -393,6 +393,14 @@ bash demos/run_demo_webcam.sh --auto_exposure manual --exposure -6
 別ツールで露光を固定してから demo を起動、または `v4l-utils` を入れて
 `v4l2-ctl --set-ctrl=exposure_auto=1 --set-ctrl=exposure_absolute=200`）。
 
+**カメラファーム側で上書きされる挙動に注意**: 一部の UVC カメラ
+（実測で Sunplus FHD Camera Microphone）は `exposure_absolute=200`
+を受理し readback も 200 を返すにもかかわらず、暗所では実際の
+integration time をファームウェアが独自に延ばし、FPS が 10 fps 前後に
+落ちます。`exposure_absolute` が hint として扱われる UVC 実装で、
+**ソフト側からは直せません**。照明を足すか、別カメラを検討してください。
+明所（モニター＋室内灯）では `--exposure 200` で 30 fps を維持できます。
+
 ### 2.4.2 MJPG にしても 15 fps で張り付き、AE 関係ない場合（cap.set 副作用）
 
 以下の全条件が揃う状況では、原因は露光ではなく **OpenCV 側の V4L2 経路
@@ -409,8 +417,24 @@ bash demos/run_demo_webcam.sh --auto_exposure manual --exposure -6
 `CAP_PROP_BUFFERSIZE=1` や `CAP_PROP_AUTO_EXPOSURE` への再アサインが
 UVC コントロールストリームの再ネゴシエーションを誘発し、
 cap.read() が 1 フレーム毎に buffer flip を待つようになり **実効 FPS が
-ちょうど半分（30 → 15）** に落ちる、というものです。切り分けと回避のため
-本ブランチの `demo_webcam.py` には 3 つのフラグを用意しています:
+ちょうど半分（30 → 15）** に落ちる、というものです。Sunplus FHD Camera
+Microphone で実測した寄与度:
+
+| 組み合わせ | 実測 FPS |
+|---|---|
+| cap.set なし (`--minimal_cap`) | 30 |
+| FOURCC=MJPG + W/H のみ（現デフォルト） | 30（capture_only）／ 15（推論あり） |
+| 現デフォルト + `--buffersize 1` 単独 | 20 |
+| 現デフォルト + `--buffersize 1` + `AUTO_EXPOSURE=3` 再アサイン | 15（halving） |
+| 現デフォルト + `--capture_thread` | 30 |
+
+**単独では BUFFERSIZE=1 でも 30 → 20 fps 程度の低下に留まり、
+halving（30→15）は BUFFERSIZE=1 と AUTO_EXPOSURE=3 再アサインの
+合わせ技で発生** するのが本カメラの実測結果。また推論パイプラインを
+挟むとメインループが cap.read() と直列化して halving 側に倒れるため、
+**capture_only 単独では halving せず推論ありで halving する** 非対称性が
+観測されます。切り分けと回避のため本ブランチの `demo_webcam.py` には
+3 つのフラグを用意しています:
 
 | フラグ | 挙動 |
 |---|---|
@@ -437,7 +461,8 @@ bash demos/run_demo_webcam.sh --capture_thread
 `CAP_PROP_AUTO_EXPOSURE=3 (auto 再アサイン)` を呼んでいましたが、この
 halving の原因に該当するため **どちらもデフォルトから外し** ました。
 低遅延が必要で backlog drain を抑えたい場合は `--buffersize 1 --capture_thread`
-のように明示併用してください。
+のように明示併用してください（ただし BUFFERSIZE=1 は本カメラでは 30→20
+fps の低下を伴うため、capture_thread 単独で十分なケースが多いです）。
 
 ### 2.5 per-stage 計測と capture_only モード
 
