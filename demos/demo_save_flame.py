@@ -38,6 +38,8 @@ Output schema (``.pt``)::
             "end_to_end_fps":     float,   # frames / total_seconds
             "mp_delegate":        str,     # "cpu" | "gpu"
             "encode_device":      str,
+            "warmup_frames":      int,     # frames excluded from bench
+            "bench_frames":       int,     # frames counted toward bench
         },
     }
 
@@ -152,6 +154,14 @@ def main():
                              'Implies --crop (mediapipe must run per-frame).')
     parser.add_argument('--benchmark', action='store_true',
                         help='Measure and report per-stage timings + FPS.')
+    parser.add_argument('--warmup', type=int, default=0,
+                        help='Frames to process before resetting the bench '
+                             'timers. Excludes one-off cold-start costs '
+                             '(MediaPipe GPU delegate shader JIT, cuDNN '
+                             'autotune, first malloc) from the reported FPS. '
+                             'The warmup frames still land in the .pt output; '
+                             'only the timing numbers skip them. Recommended '
+                             'when using --mp_delegate gpu: try --warmup 10.')
     parser.add_argument('--mp_delegate', type=str, default='cpu',
                         choices=['cpu', 'gpu'],
                         help='MediaPipe Tasks inference delegate. GPU '
@@ -192,6 +202,8 @@ def main():
     t_warp_total = 0.0
     t_decode_total = 0.0
     t_to_device_total = 0.0
+    warmup_done = args.warmup <= 0
+    per_frame_out_size_at_reset = 0
 
     def flush():
         nonlocal t_encode_total, t_to_device_total
@@ -218,6 +230,22 @@ def main():
 
     frame_count = 0
     while True:
+        if not warmup_done and frame_count >= args.warmup:
+            # Flush the pending batch so warmup-frame encode time is
+            # attributed to the warmup window, then zero all per-stage
+            # timers so the reported bench numbers reflect steady state.
+            flush()
+            if args.device.startswith('cuda'):
+                torch.cuda.synchronize()
+            per_frame_out_size_at_reset = len(per_frame_out)
+            t_start = time.perf_counter()
+            t_encode_total = 0.0
+            t_detect_total = 0.0
+            t_warp_total = 0.0
+            t_decode_total = 0.0
+            t_to_device_total = 0.0
+            warmup_done = True
+
         t_dec0 = time.perf_counter()
         ret, frame = cap.read()
         t_decode_total += time.perf_counter() - t_dec0
@@ -292,10 +320,13 @@ def main():
         result['eyelids'] = torch.stack(eyelids_rows) if eyelids_rows else torch.zeros(0, 2)
 
     if args.benchmark:
+        warmup_frames = args.warmup if warmup_done and args.warmup > 0 else 0
+        bench_frames = max(0, frame_count - warmup_frames)
+        bench_encoded = max(0, len(per_frame_out) - per_frame_out_size_at_reset)
         t_mp_total = t_detect_total + t_warp_total
-        encode_fps = (len(per_frame_out) / t_encode_total) if t_encode_total > 0 else 0.0
-        e2e_fps = (frame_count / t_total) if t_total > 0 else 0.0
-        mp_fps = (frame_count / t_mp_total) if t_mp_total > 0 else 0.0
+        encode_fps = (bench_encoded / t_encode_total) if t_encode_total > 0 else 0.0
+        e2e_fps = (bench_frames / t_total) if t_total > 0 else 0.0
+        mp_fps = (bench_frames / t_mp_total) if t_mp_total > 0 else 0.0
         result['bench'] = {
             'total_seconds': t_total,
             'encode_seconds': t_encode_total,
@@ -309,8 +340,11 @@ def main():
             'end_to_end_fps': e2e_fps,
             'mp_delegate': args.mp_delegate,
             'encode_device': args.device,
+            'warmup_frames': warmup_frames,
+            'bench_frames': bench_frames,
         }
         print(f'[bench] frames={frame_count}  valid={int(sum(valid_mask))}  '
+              f'warmup={warmup_frames}  bench_frames={bench_frames}  '
               f'mp_delegate={args.mp_delegate}  encode_device={args.device}')
         print(f'[bench] total={t_total:.2f}s  decode={t_decode_total:.2f}s  '
               f'detect={t_detect_total:.2f}s  warp={t_warp_total:.2f}s  '

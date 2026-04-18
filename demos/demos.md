@@ -164,47 +164,68 @@ SMIRK 側単独で再現したもの。
 ## 2. MediaPipe GPU / CPU 切替
 
 **実装済み**。`--mp_delegate {cpu,gpu}` フラグで切り替わります。
-デフォルトは `cpu`（互換性維持 & 実測で CPU の方が速いため、§2.1 参照）。
+デフォルトは `cpu`（短尺 / 冷状態でも安定して速く、ドライバ依存を受けない
+ため）。**GPU delegate は warm 状態ではほぼ同等〜やや速い** ため、長時間
+ワークロードでは選択肢になります（§2.1 参照）。
 
-### 2.0 結論先出し: 本構成では CPU delegate が速い
+### 2.0 結論先出し: cold と warm で挙動が変わる
 
-RTX 5090 + Ryzen/Intel 級の modern x86 + `cv2.VideoCapture → numpy`
-取り込みという今回の構成では、**CPU XNNPACK の方が GPU delegate より
-per-frame で 2–3 倍速い** ことを実測しました。`demo_save_flame.py --crop
---benchmark` の `samples/dafoe.mp4` (99 frames, 1920x1080) での計測:
+RTX 5090 + modern x86 + `cv2.VideoCapture → numpy` の構成では、
+`demo_save_flame.py --crop --benchmark` の `samples/dafoe.mp4`
+(99 frames, 1920x1080) を使って以下の値が取れます:
 
-| delegate | total | detect | encode | end_to_end_fps | mediapipe_fps |
+| delegate | 状態 | detect | encode | end_to_end_fps | 備考 |
 |---|---|---|---|---|---|
-| `cpu` | 0.89 s | **0.54 s** | 0.26 s | **111.9** | **176.3** |
-| `gpu` | 1.87 s | 1.54 s | 0.26 s | 52.8 | 63.5 |
+| `cpu` | (warm 区別なし) | 0.54 s | 0.26 s | **111.9** | XNNPACK + AVX2/AVX-512 |
+| `gpu` | **cold**（初回） | 1.54 s | 0.26 s | 52.8 | ~1 s のシェーダ JIT 同梱 |
+| `gpu` | **warm**（2 回目以降） | **0.49 s** | 0.26 s | **119.3** | シェーダキャッシュヒット |
 
-詳しくは §2.1 を参照。**`--mp_delegate gpu` は残してあるが常用は非推奨**で、
-以下のケースでのみ検討してください:
+**cold の `gpu` 行は TFLite GPU delegate のシェーダ JIT コンパイル時間
+(~1 s) を一緒に計測してしまっているためです**。NVIDIA ドライバは
+コンパイル済み GL program binary を `~/.nv/GLCache/` にディスク永続
+するため、**同じ実行ホストで 2 回目以降は JIT コストがほぼゼロ** になり、
+warm GPU は per-frame で CPU と同等〜わずかに速いレンジに乗ります。
+
+したがって短尺スクリプトを一発だけ回すと GPU が圧倒的に遅く見えますが、
+長時間／リアルタイム用途では差は小さいか逆転します。詳しくは §2.1 / §2.3。
+
+`--mp_delegate gpu` を積極的に選ぶべきケース:
 
 - CPU が他ワークロード（例: DECA + FlashAvatar 同時走行）で埋まっている
 - 組み込み/モバイル CPU など XNNPACK の SIMD 恩恵が薄い環境
-- バッチで複数顔／複数モデルを 1 回の GPU 呼び出しで処理する将来拡張
 - カメラ→GL 直接取り込みができて upload コストを 0 にできる統合（MediaPipe の
   `ImageFormat.GPU_BUFFER` 経路）
+- 数百〜数千フレームを一気に回すバッチ／リアルタイム推論（JIT コストを
+  フレーム数で割って償却できる）
 
-### 2.1 なぜ GPU delegate が遅いのか
+短尺バッチ（100 frames 級）で比較するときは後述の `--warmup` オプションで
+cold-start 分を除外してください。
+
+### 2.1 cold と warm の差分はどこから来るか
 
 MediaPipe Tasks の `face_landmarker.task` は軽量な MobileNet 派生モデル
-(~3 MB) です。GPU delegate を指定した場合、1 フレームごとに以下が発生します:
+(~3 MB) です。GPU delegate では初回呼び出し時に以下のコストが乗ります:
 
-1. numpy → GL テクスチャ **upload**（PCIe 往復、1920x1080 で ~2–3 ms）
-2. TFLite GPU delegate で推論（~2–3 ms）
-3. 478 landmark + 52 blendshape の **readback**（~1–2 ms）
-4. `FaceBlendshapesGraph` は仕様上 **常に CPU XNNPACK** なので、上記 readback 後に
-   blendshape を CPU で計算するため **二度目の GPU→CPU 転送が発生**
+1. EGL context 生成・GL textures/buffers アロケート（~数十 ms）
+2. **TFLite GPU delegate によるシェーダ JIT コンパイル**（MobileNet 全レイヤ
+   に対する GLSL compute を生成＋ドライバ側リンク、~1 秒前後）
+3. 最初のフレームのみ、ワークグループ探索／キャッシュウォーム
 
-合計 ~10–15 ms / frame。一方 CPU XNNPACK は AVX2/AVX-512 SIMD 直撃かつ
-PCIe 往復がゼロで ~5 ms / frame。モデルが小さいほど転送コストが相対的に
-支配的になるため、**小モデルでは GPU delegate が負ける** のが一般的です。
+(2) が支配項で、これが「初回実行だけ detect が 1.5 s 超になる」現象の正体です。
+NVIDIA ドライバはコンパイル済みバイナリを `~/.nv/GLCache/` にハッシュ
+キーで永続するため、**2 回目以降は OS プロセスが変わっても数 ms で**
+同じシェーダが復元されます。
 
-これは MediaPipe / TFLite の既知挙動で、Google 公式ガイドでも
-「モバイル GPU やバッチ処理でない限り XNNPACK の方が速い可能性がある」
-と明記されています。
+定常状態 (warm) では 1 frame あたり:
+
+1. numpy → GL テクスチャ **upload**（PCIe 経由、1920x1080 で ~1–2 ms）
+2. TFLite GPU delegate 推論（~2–3 ms）
+3. 478 landmark / 52 blendshape の **readback**（~1 ms）
+
+合計 ~4–6 ms ≈ CPU XNNPACK の ~5 ms と拮抗します。モデルが小さいほど
+転送コストが相対的に支配的になるため **圧勝は望めない** ですが、CPU が
+他作業で忙しいとき、または PCIe 経由ではなく GL texture 直接取り込みが
+できるときは GPU 側が勝ちます。
 
 ### 2.2 実装の仕組み
 
@@ -221,21 +242,43 @@ PCIe 往復がゼロで ~5 ms / frame。モデルが小さいほど転送コス�
 
 ### 2.3 CPU vs GPU 速度比較の取り方
 
+**重要: warm 計測を見る**。短尺動画では TFLite GPU delegate のシェーダ JIT
+コスト (~1 s) が混入して GPU が不当に遅く見えます。後述の `--warmup`
+フラグか、2 回連続で回して 2 回目を採用してください。
+
 **動画ファイル（`demo_save_flame.py`）**:
 
 ```bash
-# CPU
+# CPU（warmup 不要）
 bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 \
     --crop --benchmark --mp_delegate cpu
 
-# GPU
+# GPU（推奨: 最初の 10 frame を除外して steady-state を計測）
 bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 \
-    --crop --benchmark --mp_delegate gpu
+    --crop --benchmark --mp_delegate gpu --warmup 10
 ```
 
-出力の `[bench] mediapipe_fps=XXX` を比較。`.pt` 内 `bench` キー
-（`mediapipe_seconds`, `mediapipe_fps`, `mp_delegate`, `encode_device`）にも
-保存されるので後から集計可能。
+`--warmup N` は最初の N フレームを処理したあと **per-stage タイマを
+ゼロリセット**し、bench_frames / bench_encoded も N を差し引いた値で
+FPS を計算します（データ自体は warmup フレームも `.pt` に保存されます）。
+出力の `[bench] warmup=N bench_frames=... end_to_end_fps=XXX` を比較して
+ください。`.pt` 内 `bench` キー（`warmup_frames`, `bench_frames`,
+`mediapipe_seconds`, `mediapipe_fps`, `end_to_end_fps`, `mp_delegate`,
+`encode_device`）にも保存されるので後から集計可能。
+
+**真の cold-start を再現する**（ドライバキャッシュが邪魔なとき）:
+
+```bash
+# NVIDIA GL シェーダキャッシュを消すと次回だけ本当の cold run が取れる
+rm -rf ~/.nv/GLCache ~/.cache/nvidia
+bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 \
+    --crop --benchmark --mp_delegate gpu    # --warmup なしで cold 計測
+```
+
+キャッシュは MediaPipe Tasks のモデルバイナリと GL driver バージョンで
+ハッシュキーが決まるため、**モデルを差し替えたりドライバを上げた直後
+だけ cold が再発生** します。本番デプロイ前に 1 回ダミー実行して
+`~/.nv/GLCache/` を温めておくと、初回レイテンシが読めます。
 
 **Web カメラ（`demo_webcam.py`）**:
 
