@@ -16,13 +16,23 @@
 import torch
 import torch.nn as nn
 import numpy as np
-np.bool = np.bool_
-np.int = np.int_
-np.float = np.float_
-np.complex = np.complex_
-np.object = np.object_
-np.unicode = np.unicode_
-np.str = np.str_
+# Compatibility shim for chumpy/legacy code that reads deprecated numpy
+# scalar-type aliases (np.bool / np.int / np.float / ...). These were removed
+# in numpy 1.20+ and the underscore-suffixed spellings (np.bool_, np.int_)
+# were removed in numpy 2.0. Map each alias to the closest surviving type so
+# downstream imports (chumpy, FLAME pickle load) do not AttributeError.
+for _alias, _target in (
+    ('bool', getattr(np, 'bool_', bool)),
+    ('int', getattr(np, 'int_', int)),
+    ('float', getattr(np, 'float64', float)),
+    ('complex', getattr(np, 'complex128', complex)),
+    ('object', getattr(np, 'object_', object)),
+    ('unicode', getattr(np, 'str_', str)),
+    ('str', getattr(np, 'str_', str)),
+):
+    if not hasattr(np, _alias):
+        setattr(np, _alias, _target)
+del _alias, _target
 import pickle
 import torch.nn.functional as F
 

@@ -118,7 +118,7 @@ class SmirkEncoder(nn.Module):
 
         self.shape_encoder = ShapeEncoder(n_shape=n_shape)
 
-        self.expression_encoder = ExpressionEncoder(n_exp=n_exp) 
+        self.expression_encoder = ExpressionEncoder(n_exp=n_exp)
 
     def forward(self, img):
         pose_outputs = self.pose_encoder(img)
@@ -129,5 +129,19 @@ class SmirkEncoder(nn.Module):
         outputs.update(pose_outputs)
         outputs.update(shape_outputs)
         outputs.update(expression_outputs)
+
+        # FLARE-compatible aliases. SMIRK's legacy keys (shape_params,
+        # expression_params, pose_params, jaw_params, eyelid_params) are kept
+        # intact for FLAME.forward / trainer / existing demo scripts; the
+        # short keys below are what FLARE's SMIRKExtractor expects:
+        #   shape  (B, 300)   = shape_params
+        #   exp    (B,  50)   = expression_params
+        #   pose   (B,   6)   = cat(pose_params (global 3), jaw_params (3))
+        #   cam    (B,   3)   = cam  (already present)
+        #   eyelid (B,   2)   = eyelid_params
+        outputs['shape'] = outputs['shape_params']
+        outputs['exp'] = outputs['expression_params']
+        outputs['pose'] = torch.cat([outputs['pose_params'], outputs['jaw_params']], dim=-1)
+        outputs['eyelid'] = outputs['eyelid_params']
 
         return outputs
