@@ -357,6 +357,42 @@ bash demos/run_demo_webcam.sh --fourcc ''            # V4L2 デフォルト
 v4l2-ctl -d /dev/video0 --list-formats-ext     # カメラ側の対応フォーマット
 ```
 
+### 2.4.1 MJPG にしても 15 fps 付近で止まる場合（AE/露光制限）
+
+`--fourcc MJPG` を指定しても **ちょうど 15.0 fps で張り付き**、かつ解像度を
+`--width 640 --height 480` に下げても改善しないときは、原因は帯域でも
+MJPG エンコーダでもなく **カメラ側の auto-exposure (AE) による露光時間
+制限** です。暗い室内では UVC カメラが画を見やすくするため露光時間を
+自動で伸ばし、1 frame あたりの最低滞留時間が露光時間で頭打ちになる:
+
+| 露光時間 | 理論 FPS 上限 |
+|---|---|
+| 200 ms | 5 FPS |
+| 66 ms  | 15 FPS |
+| 50 ms  | 20 FPS |
+| 33 ms  | 30 FPS |
+
+判別方法:
+- **照明を明るくする** と FPS が上がる → AE 確定
+- オーバーレイで `cap` が 40–60 ms レンジで振動する（= カメラが次フレームを
+  吐くまでの待ち時間がそのまま露光時間）
+
+対処は AE を切って短い露光で固定:
+
+```bash
+# 20 ms 露光で 50 FPS 相当の上限を確保 (V4L2 単位: 100us/LSB)
+bash demos/run_demo_webcam.sh --auto_exposure manual --exposure 200
+
+# Windows MSMF/DSHOW の cv2 ビルドでは log2 スケール
+bash demos/run_demo_webcam.sh --auto_exposure manual --exposure -6
+```
+
+起動ログの `auto_exposure_ctrl=...  exposure_ctrl=...` でカメラドライバが
+実際に受理した値が見えるので、`cap.set()` が黙って無視されていないか
+確認できます（これが変化していなければドライバ側で蹴られている → OBS 等の
+別ツールで露光を固定してから demo を起動、または `v4l-utils` を入れて
+`v4l2-ctl --set-ctrl=exposure_auto=1 --set-ctrl=exposure_absolute=200`）。
+
 ### 2.5 per-stage 計測と capture_only モード
 
 `demo_webcam.py` は 1 フレームを 7 ステージに分解して計測し、画面オーバーレイ

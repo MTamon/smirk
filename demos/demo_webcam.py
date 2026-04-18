@@ -163,6 +163,21 @@ def main():
                              'only if the camera does not support MJPG or you '
                              'need uncompressed frames. Set to empty string '
                              '("") to leave the driver default untouched.')
+    parser.add_argument('--auto_exposure', type=str, default='auto',
+                        choices=['auto', 'manual'],
+                        help='Toggle UVC auto-exposure. When FPS is capped at '
+                             '15 even with MJPG, the camera is usually in AE '
+                             'mode and stretching exposure time in dim light, '
+                             'which upper-bounds fps as 1/exposure_seconds. '
+                             'Switch to manual and pair with --exposure to '
+                             'remove that ceiling (image will be darker).')
+    parser.add_argument('--exposure', type=float, default=None,
+                        help='Manual exposure value passed to '
+                             'cv2.CAP_PROP_EXPOSURE. On Linux V4L2 this is in '
+                             '100us units (e.g. 200 -> 20ms exposure -> 50 '
+                             'fps ceiling). On Windows MSMF/DSHOW it is '
+                             'log2-scaled (try -6 .. -4). Ignored unless '
+                             '--auto_exposure manual.')
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
@@ -232,6 +247,22 @@ def main():
         # most recent frame instead of draining a backlog when processing
         # lags. Silently ignored by drivers that do not honor it.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Auto-exposure handling. In dim rooms UVC cameras extend
+        # exposure time, which caps FPS at 1/exposure_seconds (e.g.
+        # 66ms -> 15 fps). Switch to manual + short exposure to lift
+        # that ceiling. V4L2 magic numbers: 1 = manual, 3 = aperture
+        # priority (auto); some MSMF builds use 0.25 / 0.75 instead.
+        if args.auto_exposure == 'manual':
+            ok1 = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            if args.exposure is not None:
+                ok2 = cap.set(cv2.CAP_PROP_EXPOSURE, args.exposure)
+            else:
+                ok2 = True
+            if not (ok1 and ok2):
+                print('[demo_webcam] WARN: cap.set for exposure returned False; '
+                      'driver may have ignored it.')
+        else:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
     actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
     fourcc_str = ''.join(chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4)) if actual_fourcc else ''
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -239,6 +270,13 @@ def main():
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
     print(f'[demo_webcam] source={source_handle!r} mode={"webcam" if is_webcam else "ideal-video"}  '
           f'fourcc={fourcc_str or "?"}  size={actual_w}x{actual_h}  reported_fps={actual_fps:.1f}')
+    if is_webcam:
+        # Echo back the exposure controls the driver is actually using, so
+        # a silently-ignored cap.set() or stuck AE is visible at a glance.
+        ae_val = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        exp_val = cap.get(cv2.CAP_PROP_EXPOSURE)
+        print(f'[demo_webcam] auto_exposure_ctrl={ae_val}  exposure_ctrl={exp_val}  '
+              f'(requested: auto_exposure={args.auto_exposure}, exposure={args.exposure})')
 
     save_fp = None
     if args.save_path:
