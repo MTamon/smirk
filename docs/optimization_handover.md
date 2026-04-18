@@ -537,3 +537,79 @@ CPU を引き続き選ぶべきケース:
   真に PCIe 律速。モデルを大きくするか、GL direct ingestion にしない限り
   逆転しない。ただしこれは SMIRK/FLARE 現構成では観測されていない（warm で
   拮抗する）。
+
+---
+
+## 7. ★ Web カメラ (V4L2/UVC) FPS 実測知見（DECA / FlashAvatar 同等）
+
+SMIRK の `demo_webcam.py` 実機検証で判明した cv2.VideoCapture + V4L2
+バックエンド周りの落とし穴まとめ。DECA / FlashAvatar の webcam デモ
+(`demos/demo_webcam.py` 相当) にもそのまま当てはまるので、移植時の
+チェックポイントとして保持。詳細な議論と切り分け手順は
+`demos/demos.md §2.4 / §2.4.1 / §2.4.2 / §2.6` 参照。
+
+### 7.1 結論
+
+**cv2.VideoCapture を開いたら `cap.set()` は最小限にする**。具体的には:
+
+- `CAP_PROP_FOURCC = MJPG` は **必須**（未指定だと YUYV fallback で USB 2.0
+  帯域不足により 5 fps 固定になる）
+- `CAP_PROP_FRAME_WIDTH / HEIGHT` は必要なら OK
+- `CAP_PROP_BUFFERSIZE` は **デフォルトでは触らない**（1 に強制すると
+  30 → 20 fps の軽度低下、AUTO_EXPOSURE 再アサインと組むと 15 fps halving）
+- `CAP_PROP_AUTO_EXPOSURE` は **manual に落とすときだけ** set する。auto を
+  再アサインするのは no-op どころか halving の誘因
+
+DECA の現 webcam デモ (cuda128) はそもそも **`cap.set()` を一切呼んでおらず**、
+同じ Sunplus FHD カメラで 35 fps 近く出ていた（SMIRK 側の bisect 基準値）。
+この「素で開く」挙動が実は最適解に近く、SMIRK も最低限の FOURCC + W/H だけに
+絞り込んだ結果 30 fps を達成した。
+
+### 7.2 実測した寄与度（Sunplus FHD Camera Microphone, USB 2.0, 720p）
+
+| 構成 | 実測 FPS | 原因 |
+|---|---|---|
+| FOURCC 未指定（YUYV fallback）| 5 | USB 2.0 帯域不足 (1280×720×16bpp×30 ≈ 442 Mbps) |
+| FOURCC=MJPG のみ（最小構成） | 30 | MJPG カメラ内 JPEG 圧縮で帯域収容 |
+| 上記 + BUFFERSIZE=1 | 20 | cap.read() が buffer flip を毎回待つ |
+| 上記 + AUTO_EXPOSURE=3 再アサイン + 推論パイプライン | 15 | halving: 上記 2 つ + 推論時間の直列化が合算 |
+| AE manual + exposure=200 (明所) | 30 | 20 ms 露光で 50 fps 上限確保 |
+| AE manual + exposure=200 (暗所) | 10 | カメラファームが `exposure_absolute` を hint 扱いし integration time を延長（ユーザスペースから直せない） |
+
+### 7.3 DECA / FlashAvatar 側への指針
+
+- **`cap.set()` の数は最小限に保つ**。既存 DECA の「`cv2.VideoCapture(idx)`
+  だけで開く」路線は維持。もし FOURCC 指定を足す場合は MJPG だけに留める
+  （BUFFERSIZE や AUTO_EXPOSURE は触らない）
+- **SMIRK 側の `demo_webcam.py` に `--minimal_cap` フラグを用意している**。
+  DECA 側にベンチマーク用の同名フラグを入れておくと、将来「FPS が出ない」
+  問題が起きたとき最小構成での基準値がワンコマンドで取れる
+- **`--capture_thread` パターン（background `cap.read()`）は有効**。SMIRK の
+  `CaptureThread` クラスは ~50 行で他リポジトリに丸ごとコピー可能。メイン
+  ループが推論で blocking しても cap.read() が UVC cadence から外れないので、
+  halving を根本から避けられる
+- **per-stage タイマは必須**。SMIRK は `cap / mp / pre / enc / ren / disp /
+  gui` の 7 ステージに分解して画面オーバーレイ + 終了時サマリに出している
+  (`demos/demos.md §2.5` 参照)。DECA 側に webcam bench を足すときは同じ
+  分解粒度にすると 3 リポジトリ横断で比較可能
+- **暗所 FPS 低下はカメラ依存**。ソフトで直らないケースがあることを
+  README / CLI help に明記しておく。照明を足す or 別カメラが対処法
+- **起動ログに `fourcc / size / reported_fps / auto_exposure_ctrl /
+  exposure_ctrl` を必ず echo する**。ドライバが cap.set() を黙って無視する
+  ケースが頻発するので、要求値と受理値のギャップが一目で見える必要がある
+
+### 7.4 受入チェック
+
+1. **plain 起動で 30 fps 出ること**:
+   ```bash
+   bash demos/run_demo_webcam.sh   # フラグなし
+   ```
+   Sunplus FHD / USB 2.0 / 720p で end_to_end_fps ≥ 28。
+2. **起動ログに `fourcc=MJPG  size=1280x720  reported_fps=30.0`** が出ること。
+3. **`--minimal_cap` と plain 起動で FPS が同等** であること（= デフォルト構成が
+   DECA 相当の最小 cap.set() と同じ挙動に揃っている証拠）。
+4. **per-stage サマリで `cap` が 30 ms 前後**（= カメラ実 FPS 30 の逆数）。
+   これが 50 ms 超なら halving が残っている → §7.2 の組合せを疑う。
+5. **暗所で AE manual + exposure=200 を試し、`exposure_ctrl=200.0` が
+   readback で出ること**（ドライバ層は受理している確認）。その上で FPS が
+   落ちるのはファーム依存で諦める。
