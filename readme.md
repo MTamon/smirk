@@ -46,17 +46,30 @@ bash quick_install.sh
 
 This command will also download the SMIRK pretrained model which can also be found on [Google Drive](https://drive.google.com/file/d/1T65uEd9dVLHgVw5KiUYL66NUee-MCzoE/view?usp=sharing).
 
-## Demo 
-We provide two demos. One that can be used to test the model on a single image,
+## Demo
+This fork provides four demo scripts under `demos/` with matching shell
+wrappers that scope the NVIDIA EGL vendor env vars to a subshell (needed
+for the MediaPipe GPU delegate on pure-NVIDIA hosts). See
+`demos/demos.md` for the full guide.
 
+Single image:
 ```bash
-python demo.py --input_path samples/test_image2.png --out_path results/ --checkpoint pretrained_models/SMIRK_em1.pt --crop
+bash demos/run_demo.sh --input_path samples/test_image2.png --out_path results/ --checkpoint pretrained_models/SMIRK_em1.pt --crop
 ```
 
-and one that can be used to test the model on a video,
-
+Video:
 ```bash
-python demo_video.py --input_path samples/dafoe.mp4 --out_path results/ --checkpoint pretrained_models/SMIRK_em1.pt --crop --render_orig
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --out_path results/ --checkpoint pretrained_models/SMIRK_em1.pt --crop --render_orig
+```
+
+Video → FLAME parameter save (no render, benchmarkable):
+```bash
+bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark
+```
+
+Real-time webcam with live mesh overlay:
+```bash
+bash demos/run_demo_webcam.sh --mp_delegate gpu
 ```
 
 ## Training

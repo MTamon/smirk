@@ -109,26 +109,31 @@ fi
 
 cat <<'USAGE'
 
-Next steps — run any of the demos:
+Next steps — run any of the demos via the shell-wrapper launchers
+(these scope the NVIDIA EGL vendor env vars to the subshell so the
+MediaPipe GPU delegate actually opens a GL context on the RTX and
+the variables vanish from the user's shell afterwards):
 
   # Single image (mesh overlay)
-  python demo.py --input_path samples/test_image1.png --crop
+  bash demos/run_demo.sh --input_path samples/test_image1.png --crop
 
   # Video file (mesh overlay, side-by-side mp4)
-  python demo_video.py --input_path samples/dafoe.mp4 --crop
+  bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop
 
   # Video file -> save FLAME params only (no render), with benchmark
-  python demo_save_flame.py --input_path samples/dafoe.mp4 \
+  bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 \
       --crop --benchmark
 
   # Video file -> save FLAME params + eyes_pose/eyelids from blendshapes
-  python demo_save_flame.py --input_path samples/dafoe.mp4 \
+  bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 \
       --crop --with_eye_pose --benchmark --mp_delegate gpu
 
-  # Real-time webcam with live mesh overlay
-  python demo_webcam.py --checkpoint pretrained_models/SMIRK_em1.pt
+  # Real-time webcam with live mesh overlay (MediaPipe GPU delegate)
+  bash demos/run_demo_webcam.sh --mp_delegate gpu
 
   # Real-time webcam, CPU-only benchmark mode (no mesh render)
-  python demo_webcam.py --device cpu --no_render --mp_delegate cpu
+  bash demos/run_demo_webcam.sh --device cpu --no_render --mp_delegate cpu
+
+See demos/demos.md for a detailed guide.
 
 USAGE

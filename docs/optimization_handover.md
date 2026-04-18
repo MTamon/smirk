@@ -207,16 +207,16 @@ DECA に webcam デモがあるなら、`--camera <int>` を `--source <str>` �
 # skimage baseline vs cv2 の比較は git 履歴で取れる。現行 HEAD は cv2 路線:
 
 # CPU MediaPipe + GPU SMIRK
-python demo_save_flame.py --input_path samples/dafoe.mp4 --crop --benchmark --mp_delegate cpu
+bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark --mp_delegate cpu
 
 # GPU MediaPipe + GPU SMIRK
-python demo_save_flame.py --input_path samples/dafoe.mp4 --crop --benchmark --mp_delegate gpu
+bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark --mp_delegate gpu
 
 # Web カメラ実機
-python demo_webcam.py --mp_delegate gpu
+bash demos/run_demo_webcam.sh --mp_delegate gpu
 
 # Web カメラを持たない環境 / 純粋スループット測定
-python demo_webcam.py --source samples/dafoe.mp4 --no_render --mp_delegate gpu
+bash demos/run_demo_webcam.sh --source samples/dafoe.mp4 --no_render --mp_delegate gpu
 ```
 
 ### 期待される FPS のオーダー (RTX 5090 + Ubuntu 22.04)
@@ -244,3 +244,112 @@ SMIRK より若干重いが、MobileNetV3 との差は cuDNN で吸収される�
 `utils/face_crop.py` と `skimage.transform.warp('similarity')` の出力が
 bit-exact 一致することはスモークテストで確認済み（SMIRK の推論結果が
 変わらないことも demo_save_flame.py の `.pt` diff で確認）。
+
+---
+
+## 5. ★ シェルラッパ経由の起動（FLARE / DECA / FlashAvatar 全てで重要）
+
+SMIRK 側で `demos/run_demo*.sh` → `demos/_env.sh` という **シェルラッパ
+パターン** を採用しました。要点は DECA / FLARE / FlashAvatar の統合時にも
+そのまま当てはまるので、ここに残しておきます。
+
+### 5.1 何が問題だったか
+
+- MediaPipe Tasks の `FaceLandmarker(BaseOptions(delegate=GPU))` は、
+  生成時に **EGL コンテキスト** を作る。
+- Linux の EGL は libglvnd ディスパッチで vendor を選ぶ。default では
+  MESA (`radeonsi_dri.so` / `swrast_dri.so`) を先に試す順序になっている。
+- モニター直結 (`DISPLAY=:0`) のピュア NVIDIA 環境では MESA DRI が
+  インストールされていないことが多く、EGL 初期化が失敗して
+  **MediaPipe はエラーを返さず静かに CPU XNNPACK にフォールバック**する。
+  結果: `demo_webcam.py` が ~100 FPS → ~20 FPS に落ちても気付かない。
+- SSH越し (`DISPLAY` 未設定) だと逆に MESA 試行自体がスキップされて
+  NVIDIA EGL に直行するため、同じコードで「SSH では速いのにモニター接続で
+  遅い」という逆転が起きた。
+
+### 5.2 解決方針
+
+起動時に以下の環境変数を **プロセスローカルに** セットするだけ:
+
+```bash
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+```
+
+libglvnd の vendor JSON を NVIDIA に固定するので、MESA プローブ自体が
+起きず、EGL 初期化が NVIDIA EGL ドライバで成功する。
+
+**注意点**:
+1. `FaceLandmarker` 生成 **前** に export する必要がある。libglvnd は
+   最初の EGL 呼び出し時に vendor dispatch をキャッシュするので、
+   Python 内で `os.environ['__EGL_VENDOR_LIBRARY_FILENAMES'] = ...` を
+   import 後に走らせても効かないことがある。
+2. グローバル設定（`/etc/environment` や `~/.bashrc`）に入れると、
+   wheel ビルド中やブラウザ等で MESA を期待する他プロセスと衝突する。
+   **ビルド時に効くと `install_128.sh` の GL 系テストが誤動作する** 実例あり。
+
+### 5.3 解決: シェルラッパ + `source _env.sh`
+
+```
+demos/
+├── _env.sh              # 環境変数を `source` で読み込ませる。scope は subshell のみ
+├── run_demo_webcam.sh   # 各デモ用ラッパ。`. _env.sh` → `exec python demo_*.py "$@"`
+├── run_demo.sh
+├── run_demo_video.sh
+├── run_demo_save_flame.sh
+├── demo_webcam.py       # 実体（sys.path bootstrap 内蔵）
+├── demo.py
+├── demo_video.py
+├── demo_save_flame.py
+└── demos.md
+```
+
+- `bash demos/run_demo_webcam.sh --mp_delegate gpu` で起動すると、
+  subshell 内で `__EGL_VENDOR_LIBRARY_FILENAMES` が set され、Python が
+  実行され、subshell が終了すると env vars は消える。
+- ユーザの対話シェルの `env` は一切汚染されない。
+- `install_128.sh` の実行時に `__EGL_*` が効いていないので、wheel ビルド
+  由来のトラブルを避けられる。
+- Python スクリプト側にも `sys.path` bootstrap を入れてあるので、
+  シェルラッパを使わず `python demos/demo.py ...` と直接呼んでも動く
+  （ただし GPU delegate を効かせるには自分で env を export する必要あり）。
+
+### 5.4 FLARE / DECA / FlashAvatar での同等パッチ指針
+
+**共通ルール: 「MediaPipe Tasks を使う Python プロセス」を起動する
+スクリプト／コマンドは全てシェルラッパ経由にする。**
+
+各リポジトリでの最小移植:
+
+| リポジトリ | 対象ファイル | パッチ |
+|---|---|---|
+| MTamon/DECA | `demos/run_reconstruct.sh` (新規) | `source demos/_env.sh` → `exec python demos/demo_reconstruct.py "$@"` |
+| MTamon/FlashAvatar | `demos/run_track.sh` (新規) | 同上。FlashAvatar は MediaPipe Tasks GPU delegate を使うので効く |
+| MTamon/FLARE | `demos/run_extract.sh` (新規) | SMIRKExtractor を呼ぶ extractor スクリプトを同じく `_env.sh` 経由で起動 |
+
+`_env.sh` 本体は toolchain 非依存なので **SMIRK の `demos/_env.sh` を
+そのままコピーするだけ** で OK。
+
+### 5.5 受入チェック（DECA / FLARE 側で必ず検証すべき）
+
+1. **モニター直結 (DISPLAY=:0) で `bash demos/run_*.sh --mp_delegate gpu`** の起動ログに、
+   ```
+   [demos/_env.sh] EGL vendor pinned to NVIDIA: /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+   ```
+   が出ること。`libEGL warning: MESA-LOADER ...` が **出ないこと**。
+2. **SSH越し** でも同じコマンドが動き、動作に差がないこと。
+3. **シェルラッパ終了後のユーザシェル** で
+   `echo "$__EGL_VENDOR_LIBRARY_FILENAMES"` が空であること（汚染なし）。
+4. FaceLandmarker が CPU フォールバックしていないことを、
+   `--mp_delegate gpu` 指定時の stderr に
+   `[mediapipe_utils] GPU delegate unavailable (...); falling back to CPU.` が
+   **出ないこと** で確認。
+
+### 5.6 それでも GPU delegate が効かない時
+
+- `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` が存在しない → NVIDIA の
+  GL パッケージが未インストール。`sudo apt install libnvidia-gl-<major>`。
+- ヘッドレスサーバで X もない → `Xvfb :99 -screen 0 1280x720x24 &` → `DISPLAY=:99`。
+  ただし NVIDIA EGL は display 不要で動くので通常不要。
+- WSL2 環境 → WSLg の GL 実装が NVIDIA EGL を持たないので、GPU delegate は
+  使えない。CPU XNNPACK で運用するしかない（cuDNN 側の SMIRK は別パスで動く）。

@@ -1,3 +1,12 @@
+import os
+import sys
+
+# Allow `from src.*` / `from utils.*` to resolve when the script is
+# invoked from anywhere (e.g. via demos/run_demo.sh from the repo root).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import torch
 import cv2
 import numpy as np
@@ -6,7 +15,6 @@ from src.smirk_encoder import SmirkEncoder
 from src.FLAME.FLAME import FLAME
 from src.renderer.renderer import Renderer
 import argparse
-import os
 import src.utils.masking as masking_utils
 from utils.mediapipe_utils import run_mediapipe
 from datasets.base_dataset import create_mask
