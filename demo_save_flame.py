@@ -28,9 +28,16 @@ Output schema (``.pt``)::
         "bench": {
             "total_seconds":      float,
             "encode_seconds":     float,
-            "mediapipe_seconds":  float,
+            "mediapipe_seconds":  float,   # == detect + warp (legacy alias)
+            "decode_seconds":     float,   # cv2.VideoCapture.read()
+            "detect_seconds":     float,   # mediapipe face_landmarker only
+            "warp_seconds":       float,   # cv2.warpAffine crop
+            "to_device_seconds":  float,   # numpy -> tensor -> GPU
             "encode_fps":         float,   # SMIRK batch throughput only
+            "mediapipe_fps":      float,   # frames / mediapipe_seconds
             "end_to_end_fps":     float,   # frames / total_seconds
+            "mp_delegate":        str,     # "cpu" | "gpu"
+            "encode_device":      str,
         },
     }
 
@@ -48,9 +55,9 @@ import time
 import cv2
 import numpy as np
 import torch
-from skimage.transform import estimate_transform, warp
 
 from src.smirk_encoder import SmirkEncoder
+from utils.face_crop import fast_crop_face_bgr
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
 from utils.eye_pose import estimate_eye_pose_and_eyelid
 
@@ -58,63 +65,35 @@ from utils.eye_pose import estimate_eye_pose_and_eyelid
 PARAM_DIMS = {'shape': 300, 'exp': 50, 'pose': 6, 'cam': 3, 'eyelid': 2}
 
 
-def crop_face(landmarks, scale=1.4, image_size=224):
-    left = np.min(landmarks[:, 0])
-    right = np.max(landmarks[:, 0])
-    top = np.min(landmarks[:, 1])
-    bottom = np.max(landmarks[:, 1])
-
-    old_size = (right - left + bottom - top) / 2
-    center = np.array([
-        right - (right - left) / 2.0,
-        bottom - (bottom - top) / 2.0,
-    ])
-    size = int(old_size * scale)
-
-    src_pts = np.array([
-        [center[0] - size / 2, center[1] - size / 2],
-        [center[0] - size / 2, center[1] + size / 2],
-        [center[0] + size / 2, center[1] - size / 2],
-    ])
-    dst_pts = np.array([
-        [0, 0],
-        [0, image_size - 1],
-        [image_size - 1, 0],
-    ])
-    return estimate_transform('similarity', src_pts, dst_pts)
-
-
 def detect_and_crop(frame_bgr, need_blendshapes, mp_delegate, image_size=224):
-    """Return (rgb_224 uint8 or None, blendshapes or None, mp_elapsed).
+    """Return (rgb_224 uint8 or None, blendshapes or None, t_detect, t_warp).
 
     When need_blendshapes is False this uses the lighter ``run_mediapipe``
-    path and the returned blendshapes dict is None.
+    path and the returned blendshapes dict is None. Detection time and
+    warp time are reported separately so per-stage benchmarks can tell
+    them apart.
     """
     t0 = time.perf_counter()
     if need_blendshapes:
         mp_result = run_mediapipe_full(frame_bgr, delegate=mp_delegate)
-        t_mp = time.perf_counter() - t0
+        t_detect = time.perf_counter() - t0
         if mp_result is None:
-            return None, None, t_mp
+            return None, None, t_detect, 0.0
         landmarks = mp_result['landmarks'][..., :2]
         blendshapes = mp_result['blendshapes']
     else:
         landmarks = run_mediapipe(frame_bgr, delegate=mp_delegate)
-        t_mp = time.perf_counter() - t0
+        t_detect = time.perf_counter() - t0
         if landmarks is None:
-            return None, None, t_mp
+            return None, None, t_detect, 0.0
         landmarks = landmarks[..., :2]
         blendshapes = None
 
-    tform = crop_face(landmarks, scale=1.4, image_size=image_size)
-    cropped = warp(
-        frame_bgr,
-        tform.inverse,
-        output_shape=(image_size, image_size),
-        preserve_range=True,
-    ).astype(np.uint8)
-    cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-    return cropped, blendshapes, t_mp
+    t1 = time.perf_counter()
+    cropped_bgr = fast_crop_face_bgr(frame_bgr, landmarks, scale=1.4, image_size=image_size)
+    cropped = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
+    t_warp = time.perf_counter() - t1
+    return cropped, blendshapes, t_detect, t_warp
 
 
 def resize_only(frame_bgr, image_size=224):
@@ -184,6 +163,9 @@ def main():
         args.out_path = os.path.join('output', f'{stem}_flame.pt')
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or '.', exist_ok=True)
 
+    if args.device.startswith('cuda'):
+        torch.backends.cudnn.benchmark = True
+
     encoder = load_encoder(args.checkpoint, args.device)
 
     cap = cv2.VideoCapture(args.input_path)
@@ -201,15 +183,21 @@ def main():
 
     t_start = time.perf_counter()
     t_encode_total = 0.0
-    t_mp_total = 0.0
+    t_detect_total = 0.0
+    t_warp_total = 0.0
+    t_decode_total = 0.0
+    t_to_device_total = 0.0
 
     def flush():
-        nonlocal t_encode_total
+        nonlocal t_encode_total, t_to_device_total
         if not batch_imgs:
             return
+        t_td0 = time.perf_counter()
         imgs_tensor = to_tensor_batch(batch_imgs, args.device)
         if args.device.startswith('cuda'):
             torch.cuda.synchronize()
+        t_to_device_total += time.perf_counter() - t_td0
+
         t_enc0 = time.perf_counter()
         with torch.no_grad():
             out = encoder(imgs_tensor)
@@ -225,16 +213,19 @@ def main():
 
     frame_count = 0
     while True:
+        t_dec0 = time.perf_counter()
         ret, frame = cap.read()
+        t_decode_total += time.perf_counter() - t_dec0
         if not ret:
             break
 
         if args.crop:
-            rgb_224, blendshapes, t_mp = detect_and_crop(
+            rgb_224, blendshapes, t_detect, t_warp = detect_and_crop(
                 frame, need_blendshapes=args.with_eye_pose,
                 mp_delegate=args.mp_delegate,
             )
-            t_mp_total += t_mp
+            t_detect_total += t_detect
+            t_warp_total += t_warp
             if rgb_224 is None:
                 valid_mask.append(False)
                 frame_count += 1
@@ -296,6 +287,7 @@ def main():
         result['eyelids'] = torch.stack(eyelids_rows) if eyelids_rows else torch.zeros(0, 2)
 
     if args.benchmark:
+        t_mp_total = t_detect_total + t_warp_total
         encode_fps = (len(per_frame_out) / t_encode_total) if t_encode_total > 0 else 0.0
         e2e_fps = (frame_count / t_total) if t_total > 0 else 0.0
         mp_fps = (frame_count / t_mp_total) if t_mp_total > 0 else 0.0
@@ -303,6 +295,10 @@ def main():
             'total_seconds': t_total,
             'encode_seconds': t_encode_total,
             'mediapipe_seconds': t_mp_total,
+            'decode_seconds': t_decode_total,
+            'detect_seconds': t_detect_total,
+            'warp_seconds': t_warp_total,
+            'to_device_seconds': t_to_device_total,
             'encode_fps': encode_fps,
             'mediapipe_fps': mp_fps,
             'end_to_end_fps': e2e_fps,
@@ -311,8 +307,9 @@ def main():
         }
         print(f'[bench] frames={frame_count}  valid={int(sum(valid_mask))}  '
               f'mp_delegate={args.mp_delegate}  encode_device={args.device}')
-        print(f'[bench] total={t_total:.2f}s  encode={t_encode_total:.2f}s  '
-              f'mediapipe={t_mp_total:.2f}s')
+        print(f'[bench] total={t_total:.2f}s  decode={t_decode_total:.2f}s  '
+              f'detect={t_detect_total:.2f}s  warp={t_warp_total:.2f}s  '
+              f'to_device={t_to_device_total:.2f}s  encode={t_encode_total:.2f}s')
         print(f'[bench] encode_fps={encode_fps:.1f}  mediapipe_fps={mp_fps:.1f}  '
               f'end_to_end_fps={e2e_fps:.1f}')
 

@@ -1,9 +1,19 @@
 """Real-time webcam FLAME extraction with SMIRK + live mesh overlay.
 
-Opens a webcam, runs per-frame face detection (MediaPipe Tasks API),
-encodes with SMIRK, renders the reconstructed FLAME mesh with the
-existing Renderer, and displays the webcam frame and mesh side-by-side
-with an FPS overlay.
+Opens a webcam (or a pre-recorded video in "ideal-source" mode), runs
+per-frame face detection (MediaPipe Tasks API), encodes with SMIRK,
+renders the reconstructed FLAME mesh with the existing Renderer, and
+displays the webcam frame and mesh side-by-side with an FPS overlay.
+
+The ideal-source mode is enabled by passing a video file path to
+``--source`` instead of a camera index: it reads frames as fast as
+``cv2.VideoCapture`` can decode them (no hardware-limited frame rate)
+so the end-to-end pipeline throughput can be measured when the camera
+is not the bottleneck. **The pipeline itself is identical** between
+real-webcam and ideal-source modes — we do NOT pre-transfer frames to
+the GPU or batch across frames — only the frame source differs. The
+only other difference is the mirror flip, which is applied only for
+live webcams (it would be incorrect for a recorded clip).
 
 Optional features:
     --with_eye_pose : additionally extract rot6d eyes_pose (12D) and
@@ -28,6 +38,10 @@ Examples::
 
     # log SMIRK + eye-pose to JSONL while showing mesh
     python demo_webcam.py --with_eye_pose --save_path output/webcam_log.jsonl
+
+    # ideal-source mode: read frames from a file as fast as possible.
+    # Same pipeline as the live webcam, just no hardware FPS ceiling.
+    python demo_webcam.py --source samples/dafoe.mp4 --no_render
 """
 
 import argparse
@@ -39,36 +53,11 @@ from collections import deque
 import cv2
 import numpy as np
 import torch
-from skimage.transform import estimate_transform, warp
 
 from src.smirk_encoder import SmirkEncoder
+from utils.face_crop import fast_crop_face_bgr
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
 from utils.eye_pose import estimate_eye_pose_and_eyelid
-
-
-def crop_face(landmarks, scale=1.4, image_size=224):
-    left = np.min(landmarks[:, 0])
-    right = np.max(landmarks[:, 0])
-    top = np.min(landmarks[:, 1])
-    bottom = np.max(landmarks[:, 1])
-
-    old_size = (right - left + bottom - top) / 2
-    center = np.array([
-        right - (right - left) / 2.0,
-        bottom - (bottom - top) / 2.0,
-    ])
-    size = int(old_size * scale)
-    src_pts = np.array([
-        [center[0] - size / 2, center[1] - size / 2],
-        [center[0] - size / 2, center[1] + size / 2],
-        [center[0] + size / 2, center[1] - size / 2],
-    ])
-    dst_pts = np.array([
-        [0, 0],
-        [0, image_size - 1],
-        [image_size - 1, 0],
-    ])
-    return estimate_transform('similarity', src_pts, dst_pts)
 
 
 def load_encoder(checkpoint_path, device):
@@ -126,12 +115,18 @@ def main():
     parser.add_argument('--checkpoint', type=str,
                         default='pretrained_models/SMIRK_em1.pt')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--camera', type=int, default=0,
-                        help='OpenCV VideoCapture device index.')
+    parser.add_argument('--source', type=str, default='0',
+                        help='Frame source. Integer string → webcam index. '
+                             'Otherwise a path to a video file (ideal-source '
+                             'mode: reads as fast as VideoCapture decodes, '
+                             'no hardware FPS ceiling). Pipeline is otherwise '
+                             'identical between the two modes.')
+    parser.add_argument('--camera', type=int, default=None,
+                        help='(deprecated) synonym for --source <int>.')
     parser.add_argument('--width', type=int, default=1280,
-                        help='Requested webcam capture width.')
+                        help='Requested webcam capture width (webcam only).')
     parser.add_argument('--height', type=int, default=720,
-                        help='Requested webcam capture height.')
+                        help='Requested webcam capture height (webcam only).')
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
@@ -154,6 +149,9 @@ def main():
     if str(device) != args.device:
         print(f'[demo_webcam] requested {args.device} but using {device}')
 
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+
     encoder = load_encoder(args.checkpoint, device)
 
     flame = None
@@ -165,11 +163,22 @@ def main():
         flame = FLAME().to(device)
         renderer = Renderer().to(device)
 
-    cap = cv2.VideoCapture(args.camera)
+    # Resolve --source: integer → webcam, anything else → video file path.
+    source_arg = args.source if args.camera is None else str(args.camera)
+    try:
+        source_handle: object = int(source_arg)
+        is_webcam = True
+    except ValueError:
+        source_handle = source_arg
+        is_webcam = False
+
+    cap = cv2.VideoCapture(source_handle)
     if not cap.isOpened():
-        raise RuntimeError(f'Could not open webcam index {args.camera}.')
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        raise RuntimeError(f'Could not open source: {source_handle!r}')
+    if is_webcam:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    print(f'[demo_webcam] source={source_handle!r} mode={"webcam" if is_webcam else "ideal-video"}')
 
     save_fp = None
     if args.save_path:
@@ -180,6 +189,12 @@ def main():
 
     fps_window = deque(maxlen=30)
     frame_idx = 0
+    # Aggregate (sum over all frames) for the final summary print.
+    agg_mp_s = 0.0
+    agg_enc_s = 0.0
+    agg_ren_s = 0.0
+    agg_face_ok = 0
+    t_run0 = time.perf_counter()
     print('[demo_webcam] q: quit, s: snapshot')
 
     try:
@@ -188,9 +203,10 @@ def main():
 
             ret, frame = cap.read()
             if not ret:
-                print('[demo_webcam] webcam read failed')
+                print('[demo_webcam] frame read failed / EOF')
                 break
-            frame = cv2.flip(frame, 1)  # mirror for natural selfie-view
+            if is_webcam:
+                frame = cv2.flip(frame, 1)  # mirror only for live selfie view
             orig_h, orig_w = frame.shape[:2]
 
             # --- MediaPipe ---
@@ -218,11 +234,7 @@ def main():
             eyelids_np = None
 
             if face_ok:
-                tform = crop_face(landmarks, scale=1.4, image_size=224)
-                cropped_bgr = warp(
-                    frame, tform.inverse, output_shape=(224, 224),
-                    preserve_range=True,
-                ).astype(np.uint8)
+                cropped_bgr = fast_crop_face_bgr(frame, landmarks, scale=1.4, image_size=224)
                 cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
                 tensor = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                 tensor = tensor.to(device, non_blocking=True)
@@ -279,6 +291,12 @@ def main():
             fps_window.append(t_frame)
             avg_fps = len(fps_window) / max(sum(fps_window), 1e-6)
 
+            agg_mp_s += t_mp / 1000.0
+            agg_enc_s += enc_ms / 1000.0
+            agg_ren_s += ren_ms / 1000.0
+            if face_ok:
+                agg_face_ok += 1
+
             extras = []
             if args.with_eye_pose and eyes_pose_np is not None:
                 extras.append(
@@ -307,7 +325,15 @@ def main():
         cv2.destroyAllWindows()
         if save_fp is not None:
             save_fp.close()
-        print(f'[demo_webcam] processed {frame_idx} frames')
+        t_run = time.perf_counter() - t_run0
+        e2e_fps = (frame_idx / t_run) if t_run > 0 else 0.0
+        def _avg_ms(total_s): return (1000.0 * total_s / frame_idx) if frame_idx else 0.0
+        print(f'[demo_webcam] processed {frame_idx} frames in {t_run:.2f}s '
+              f'(valid={agg_face_ok}, end_to_end_fps={e2e_fps:.1f})')
+        print(f'[demo_webcam] avg-per-frame  mp={_avg_ms(agg_mp_s):.1f}ms  '
+              f'enc={_avg_ms(agg_enc_s):.1f}ms  ren={_avg_ms(agg_ren_s):.1f}ms  '
+              f'mp_delegate={args.mp_delegate}  enc_device={str(device)}  '
+              f'mode={"webcam" if is_webcam else "ideal-video"}')
 
 
 if __name__ == '__main__':
