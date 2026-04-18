@@ -178,6 +178,14 @@ def main():
                              'fps ceiling). On Windows MSMF/DSHOW it is '
                              'log2-scaled (try -6 .. -4). Ignored unless '
                              '--auto_exposure manual.')
+    parser.add_argument('--camera_fps', type=float, default=None,
+                        help='Request a target frame rate from the camera via '
+                             'cv2.CAP_PROP_FPS. Most UVC drivers honor it if '
+                             'the (fourcc, width, height, fps) tuple exists in '
+                             'the camera descriptor; silently ignored '
+                             'otherwise. Use when the startup log shows a '
+                             'reported_fps lower than the camera spec and you '
+                             'want to force negotiation to a higher mode.')
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
@@ -243,6 +251,8 @@ def main():
             cap.set(cv2.CAP_PROP_FOURCC, fourcc_val)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        if args.camera_fps is not None:
+            cap.set(cv2.CAP_PROP_FPS, args.camera_fps)
         # Shrink the driver-side queue so cap.read() always returns the
         # most recent frame instead of draining a backlog when processing
         # lags. Silently ignored by drivers that do not honor it.
