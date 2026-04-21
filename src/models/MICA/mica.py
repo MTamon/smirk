@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.MICA.arcface import Arcface
+from .arcface import Arcface
 
 
 def kaiming_leaky_init(m):

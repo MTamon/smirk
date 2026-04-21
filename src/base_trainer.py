@@ -7,7 +7,7 @@ import cv2
 import os
 import random
 import copy
-from src.utils.utils import batch_draw_keypoints, make_grid_from_opencv_images
+from .utils.utils import batch_draw_keypoints, make_grid_from_opencv_images
 
 class BaseTrainer(nn.Module):
     def __init__(self, config):
@@ -75,7 +75,7 @@ class BaseTrainer(nn.Module):
         
 
     def setup_losses(self):
-        from src.losses.VGGPerceptualLoss import VGGPerceptualLoss
+        from .losses.VGGPerceptualLoss import VGGPerceptualLoss
         self.vgg_loss = VGGPerceptualLoss()
         self.vgg_loss.eval()
         for param in self.vgg_loss.parameters():
@@ -83,7 +83,7 @@ class BaseTrainer(nn.Module):
         
             
         if self.config.train.loss_weights['emotion_loss'] > 0:
-            from src.losses.ExpressionLoss import ExpressionLoss
+            from .losses.ExpressionLoss import ExpressionLoss
             self.emotion_loss = ExpressionLoss()
             # freeze the emotion model
             self.emotion_loss.eval()
@@ -91,7 +91,7 @@ class BaseTrainer(nn.Module):
                 param.requires_grad_(False)
 
         if self.config.train.loss_weights['mica_loss'] > 0:
-            from src.models.MICA.mica import MICA
+            from .models.MICA.mica import MICA
 
             self.mica = MICA()
             self.mica.eval()

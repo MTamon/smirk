@@ -4,8 +4,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import cv2
-from src.renderer.util import vertex_normals, face_vertices 
-from src.FLAME.lbs import vertices2landmarks
+from ..renderer.util import vertex_normals, face_vertices
+from ..FLAME.lbs import vertices2landmarks
 
 
 def load_probabilities_per_FLAME_triangle():
