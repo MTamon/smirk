@@ -119,6 +119,12 @@ bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --s
 
 # 点数を間引いて密度を下げる（5023 頂点 → stride=4 で約 1256 点）
 bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_stride 4
+
+# 1 ピクセル点（LINE_AA なしの直接代入）。低解像度動画で最も目立たない
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius 0
+
+# 動画解像度に対する相対サイズ（短辺の 0.1% = 1080p なら ~1px、4K なら ~2px）
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius_rel 0.001
 ```
 
 **補足:**
@@ -128,6 +134,103 @@ bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --s
 - `--render_orig` 併用時は crop→原画の similarity transform `tform.inverse`
   を使って原画ピクセル空間に lift してから描画します
 - 保存される `.pt`・FLAME パラメータには影響しません（描画専用）
+- **点サイズの選び方**：
+  - `--vertex_radius 0` は `cv2.circle` も LINE_AA も経由せず 1 ピクセルを
+    直接代入するため、低解像度動画で最もクリスプな描画になります。
+    `--vertex_radius 1` は LINE_AA で実質 3×3 のにじみになるので
+    「1 px でも大きすぎる」と感じる場合に `0` を試してください
+  - `--vertex_radius_rel` は描画パネルの短辺 `min(h, w)` に対する比率で半径を
+    指定します。0.001 で 1080p なら ~1 px、640x480 なら 0.48 → 丸めて 0
+    （= 1 ピクセル直接代入）になります。異なる解像度の動画を同じスクリプト
+    で比較するときはこちらを使うと見た目が揃います
+  - 両方指定された場合は `--vertex_radius_rel` が優先されます
+
+### 1.3 `--bbox_mode`: FLAME mesh の jitter を抑える bbox 時間安定化
+
+既定の `demo_video.py --crop` は毎フレーム MediaPipe の 478 ランドマーク
+全点から `min/max` で bbox を作っていたため、口を開くと bbox が縦に伸び、
+crop スケールが変動して **耳・頭頂で mesh が揺れる／膨らむ** 症状が出ていました。
+本ブランチでは `--bbox_mode` フラグで 3 つの挙動を選択できます：
+
+| モード | 用途 | 仕組み |
+|---|---|---|
+| `online`（既定） | リアルタイム / webcam / 一般用途 | 安定ランドマーク部分集合（目尻・鼻梁・こめかみ 15点）から `size` を算出し、One-Euro filter で適応平滑化。O(1) state で webcam OK |
+| `offline` | 品質最優先のバッチ処理 | Pass 1 で全フレームのランドマークを集め、`size` 系列にゼロ位相 FIR LPF（既定 2.5Hz）を適用してから Pass 2 で推論・描画 |
+| `legacy` | A/B 比較 / 再現性確認 | 旧挙動（全ランドマーク min/max、時間平滑化なし）を完全に再現 |
+
+```bash
+# 既定（online）。明示しなくても良いが分かりやすさのため
+bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode online
+
+# オフライン（品質重視）。2 パス処理なので実行時間は ~1.5× になる
+bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode offline
+
+# 旧挙動（修正なし）。A/B 比較用
+bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode legacy
+```
+
+**設計の肝**：
+
+- **`center` は平滑化しない**（既定）。頭の並進（振り向き・歩行）は mesh の
+  描画位置に直結するので、遅延を入れると顔と mesh がずれます。サイズ変動
+  のほうが視覚的に目立つので、`size` だけ平滑化する設計
+- **安定ランドマーク部分集合**だけで `size` を算出するので、6-7Hz の口の動き
+  は元から `size` 信号に載らない → LPF カットオフを 2.5Hz まで下げても問題ない
+- **One-Euro filter の beta** で適応度を調整。`beta=0.02`（既定）は静止時に
+  強平滑、急な距離変化でも低遅延で追従する
+
+詳細な設計思想と周波数選択の根拠は `docs/bbox_stabilization.md` を参照。
+
+### 1.3.1 `--freeze_shape`: identity パラメータの凍結（オプトイン）
+
+SMIRK の `ShapeEncoder` は毎フレーム独立に identity（`shape_params` 300 次元）
+を推論しますが、本来 identity は時間不変のはず。クロップ揺れが漏れ込んで
+shape が毎フレーム微変動することが mesh の "膨らみ" に寄与します。
+
+`--freeze_shape` を付けると：
+
+- **`--bbox_mode online` 時**：最初の `--freeze_shape_warmup_frames`（既定
+  45 ≈ 1.5 s @ 30fps）の median を取って以降固定
+- **`--bbox_mode offline` 時**：事前パスで全フレームの `shape_params` を
+  集めて median を取り、本パスで全フレームに適用（= global median）
+
+```bash
+# online + warm-up median（webcam/リアルタイム想定）
+bash demos/run_demo_video.sh --input_path <mp4> --crop --freeze_shape
+
+# warm-up 長を変える（例：3 秒 = 90 フレーム @ 30fps）
+bash demos/run_demo_video.sh --input_path <mp4> --crop --freeze_shape --freeze_shape_warmup_frames 90
+
+# offline + 全フレーム median（品質最優先。推論 pass が 1 つ追加で走る）
+bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode offline --freeze_shape
+```
+
+**使用条件**：
+
+- 同一人物が映り続ける動画（途中で人物が切り替わらない）
+- warm-up の間、被写体が概ね静止して検出が安定している
+
+人物が変わる・warm-up が顔検出失敗続きで壊れる場合はオフにしてください。
+
+### 1.3.2 `--bbox_mode` / `--freeze_shape` の全 CLI フラグ
+
+`bash demos/run_demo_video.sh --input_path <mp4> --help` で出るものと同じですが、
+関連フラグを一覧化：
+
+| フラグ | 既定 | 説明 |
+|---|---|---|
+| `--bbox_mode` | `online` | `legacy` / `online` / `offline` |
+| `--bbox_scale` | `1.4` | bbox パディング係数。旧値と同じ |
+| `--bbox_all_landmarks` | false | 指定時は旧挙動（478 点全て使用） |
+| `--online_size_min_cutoff` | `1.0` | One-Euro 最小カットオフ（Hz） |
+| `--online_size_beta` | `0.02` | One-Euro 速度感度 |
+| `--online_center_cutoff` | None | 指定時のみ center も One-Euro 平滑化 |
+| `--online_center_beta` | `0.02` | center One-Euro 速度感度 |
+| `--offline_size_cutoff` | `2.5` | FIR LPF カットオフ（Hz） |
+| `--offline_size_taps` | `61` | FIR tap 数（奇数に強制） |
+| `--offline_center_cutoff` | None | 指定時のみ center も LPF |
+| `--freeze_shape` | false | shape 凍結オプトイン |
+| `--freeze_shape_warmup_frames` | `45` | online 時の warm-up 長 |
 
 ### ステップ A.5. シェルラッパ経由で実行する理由（重要）
 

@@ -15,6 +15,12 @@ from src.renderer.renderer import Renderer
 import argparse
 import src.utils.masking as masking_utils
 from utils.mediapipe_utils import run_mediapipe
+from utils.bbox_tracker import (
+    OnlineBBoxTracker,
+    build_similarity_tform,
+    extract_bbox_center_size,
+    fir_lowpass_offline,
+)
 from datasets.base_dataset import create_mask
 import torch.nn.functional as F
 
@@ -46,7 +52,7 @@ def _crop_pixels_to_full_pixels(crop_pixels, tform):
 
 
 def _draw_vertex_points(img_chw_tensor, pixels_xy,
-                        color_rgb=(0, 255, 255), radius=1, stride=1):
+                        color_rgb=(0, 255, 255), radius=1, radius_rel=None, stride=1):
     """Draw points at ``pixels_xy`` on ``img_chw_tensor``.
 
     Useful for inspecting head regions that the default face-only rasterizer
@@ -56,20 +62,42 @@ def _draw_vertex_points(img_chw_tensor, pixels_xy,
     ``color_rgb`` is interpreted in the same channel order as the input image
     (demos use RGB intermediate, then swap to BGR for the video writer), so
     (0, 255, 255) renders as cyan in the final mp4.
+
+    ``radius`` is the absolute radius in pixels. ``radius=0`` writes a single
+    pixel directly (no ``cv2.circle`` / no LINE_AA), which is the crispest
+    possible dot — useful on low-resolution videos where even radius=1 looks
+    large because LINE_AA bleeds across a 3x3 neighbourhood.
+
+    ``radius_rel``, if given, overrides ``radius`` and is interpreted as a
+    fraction of ``min(frame_h, frame_w)``. This lets the caller specify "dots
+    roughly 0.1% of the frame" once and get sensible sizes across 480p, 1080p,
+    and 4K inputs. Values that round down to 0 produce single-pixel dots.
     """
     _, _, h, w = img_chw_tensor.shape
+    if radius_rel is not None:
+        r = int(round(float(radius_rel) * min(h, w)))
+    else:
+        r = int(radius)
+    r = max(0, r)
+
     img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8).copy()
 
     pts = pixels_xy
     if stride > 1:
         pts = pts[::stride]
 
-    colour = tuple(int(v) for v in color_rgb)
-    r = int(max(1, radius))
-    for x, y in pts:
-        xi, yi = int(x), int(y)
-        if 0 <= xi < w and 0 <= yi < h:
-            cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
+    if r == 0:
+        colour_arr = np.array([int(v) for v in color_rgb], dtype=np.uint8)
+        for x, y in pts:
+            xi, yi = int(x), int(y)
+            if 0 <= xi < w and 0 <= yi < h:
+                img_np[yi, xi] = colour_arr
+    else:
+        colour = tuple(int(v) for v in color_rgb)
+        for x, y in pts:
+            xi, yi = int(x), int(y)
+            if 0 <= xi < w and 0 <= yi < h:
+                cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
 
     return (
         torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
@@ -120,10 +148,79 @@ if __name__ == '__main__':
                              'omits (ears, scalp, neck). Combine with --overlay to inspect '
                              'the full predicted shape against the real face.')
     parser.add_argument('--vertex_radius', type=int, default=1,
-                        help='Radius (px) for each vertex dot. Default 1.')
+                        help='Absolute radius (px) for each vertex dot. Pass 0 '
+                             'to draw a true single-pixel dot (no anti-aliasing), '
+                             'which is the crispest option on low-resolution '
+                             'videos where LINE_AA circles look fuzzy. Ignored '
+                             'when --vertex_radius_rel is set. Default 1.')
+    parser.add_argument('--vertex_radius_rel', type=float, default=None,
+                        help='Radius expressed as a fraction of '
+                             'min(frame_height, frame_width) on the panel that '
+                             'the dots are drawn on. E.g. 0.001 on a 1080p frame '
+                             '→ ~1 px; 0.0005 → single-pixel dot. Overrides '
+                             '--vertex_radius when set. Recommended over the '
+                             'absolute flag when comparing across videos of '
+                             'different resolutions.')
     parser.add_argument('--vertex_stride', type=int, default=1,
                         help='Stride when sampling the ~5023 FLAME vertices '
                              '(1 = every vertex; 2 = every other; etc.). Default 1.')
+
+    parser.add_argument('--bbox_mode', type=str, default='online',
+                        choices=['legacy', 'online', 'offline'],
+                        help='How to derive the per-frame face bbox. '
+                             '"legacy" reproduces the original min/max-over-all-landmarks '
+                             'behavior (kept for A/B comparisons). "online" uses the '
+                             'stable-landmark subset and One-Euro-filters the bbox size '
+                             '(O(1) state, suitable for webcam/real-time). "offline" '
+                             'runs a pre-pass over the whole video, applies a zero-phase '
+                             'FIR low-pass to the raw size series, then processes frames '
+                             'with the smoothed bbox. Default "online".')
+    parser.add_argument('--bbox_scale', type=float, default=1.4,
+                        help='Padding multiplier around the landmark bbox (same as '
+                             'the legacy scale=1.4). Default 1.4.')
+    parser.add_argument('--bbox_all_landmarks', action='store_true',
+                        help='Use every MediaPipe landmark to derive the bbox (legacy '
+                             'behavior). By default only a speech/blink-invariant subset '
+                             '(eye corners, nose bridge, temples) is used so the bbox '
+                             'size does not grow when the mouth opens.')
+    parser.add_argument('--online_size_min_cutoff', type=float, default=1.0,
+                        help='One-Euro min_cutoff (Hz) for the bbox-size filter in '
+                             '--bbox_mode online. Default 1.0.')
+    parser.add_argument('--online_size_beta', type=float, default=0.02,
+                        help='One-Euro beta (speed sensitivity) for the bbox-size '
+                             'filter in --bbox_mode online. Default 0.02.')
+    parser.add_argument('--online_center_cutoff', type=float, default=None,
+                        help='If set, also One-Euro-filter the bbox center with this '
+                             'min_cutoff (Hz) in --bbox_mode online. Leave unset to '
+                             'pass center through unsmoothed (recommended; head '
+                             'translation should follow fast motion faithfully).')
+    parser.add_argument('--online_center_beta', type=float, default=0.02,
+                        help='One-Euro beta for the bbox-center filter (only used when '
+                             '--online_center_cutoff is set). Default 0.02.')
+    parser.add_argument('--offline_size_cutoff', type=float, default=2.5,
+                        help='Zero-phase FIR low-pass cutoff (Hz) for the bbox-size '
+                             'series in --bbox_mode offline. The size signal carries '
+                             'only camera-distance changes once the stable-landmark '
+                             'subset is used, so 2-3 Hz is usually safe. Default 2.5.')
+    parser.add_argument('--offline_size_taps', type=int, default=61,
+                        help='Number of FIR taps for the offline size low-pass. Must be '
+                             'shorter than the video. Default 61 (≈1 s group delay at '
+                             '30 fps before edge compensation).')
+    parser.add_argument('--offline_center_cutoff', type=float, default=None,
+                        help='If set, also FIR-low-pass the bbox center in '
+                             '--bbox_mode offline with this cutoff (Hz). Leave unset '
+                             'to preserve raw center tracking.')
+    parser.add_argument('--freeze_shape', action='store_true',
+                        help='Lock the predicted FLAME shape (identity) parameters. '
+                             'With --bbox_mode online: collect shape_params for '
+                             '--freeze_shape_warmup_frames frames, take a median, then '
+                             'override all subsequent predictions with it. With '
+                             '--bbox_mode offline: run an extra pre-pass over the whole '
+                             'video and use the global median. Opt-in — useful when '
+                             'the subject is stationary enough to calibrate.')
+    parser.add_argument('--freeze_shape_warmup_frames', type=int, default=45,
+                        help='Warm-up length (frames) for --freeze_shape in online '
+                             'mode. Default 45 (≈1.5 s at 30 fps).')
 
     args = parser.parse_args()
 
@@ -184,6 +281,108 @@ if __name__ == '__main__':
 
     cap_out = cv2.VideoWriter(f"{args.out_path}/{args.input_path.split('/')[-1].split('.')[0]}.mp4", cv2.VideoWriter_fourcc(*'mp4v'), video_fps, (out_width, out_height))
 
+    # ------------------------- bbox stabilization setup ------------------------- #
+    # ``precomputed_tforms`` is populated by the offline pre-pass and indexed by
+    # frame number in the main loop. ``bbox_tracker`` is the stateful One-Euro
+    # wrapper used for --bbox_mode online. Only one of them is active at a time;
+    # --bbox_mode legacy leaves both unset and calls ``crop_face`` directly.
+    precomputed_tforms = None
+    bbox_tracker = None
+    use_stable_subset = not args.bbox_all_landmarks
+
+    if args.crop and args.bbox_mode == 'offline':
+        # Pass 1: read every frame, detect landmarks, collect raw (center, size).
+        raw_centers = []
+        raw_sizes = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            kpt = run_mediapipe(frame)
+            if kpt is None:
+                print('Could not find landmarks during offline pass 1. Exiting...')
+                exit()
+            center_i, size_i = extract_bbox_center_size(
+                kpt[..., :2], use_stable_subset=use_stable_subset,
+            )
+            raw_centers.append(center_i)
+            raw_sizes.append(size_i)
+        cap.release()
+
+        raw_centers = np.stack(raw_centers, axis=0)
+        raw_sizes = np.asarray(raw_sizes, dtype=np.float64)
+
+        smoothed_sizes = fir_lowpass_offline(
+            raw_sizes, fps=video_fps,
+            cutoff_hz=args.offline_size_cutoff, taps=args.offline_size_taps,
+        )
+        smoothed_centers = raw_centers.copy()
+        if args.offline_center_cutoff is not None and args.offline_center_cutoff > 0:
+            smoothed_centers[:, 0] = fir_lowpass_offline(
+                raw_centers[:, 0], fps=video_fps,
+                cutoff_hz=args.offline_center_cutoff, taps=args.offline_size_taps,
+            )
+            smoothed_centers[:, 1] = fir_lowpass_offline(
+                raw_centers[:, 1], fps=video_fps,
+                cutoff_hz=args.offline_center_cutoff, taps=args.offline_size_taps,
+            )
+
+        precomputed_tforms = [
+            build_similarity_tform(
+                smoothed_centers[i], float(smoothed_sizes[i]),
+                scale=args.bbox_scale, image_size=input_image_size,
+            )
+            for i in range(len(raw_sizes))
+        ]
+
+        # Reopen the capture for the main processing loop.
+        cap = cv2.VideoCapture(args.input_path)
+
+    elif args.crop and args.bbox_mode == 'online':
+        bbox_tracker = OnlineBBoxTracker(
+            fps=video_fps, image_size=input_image_size, scale=args.bbox_scale,
+            use_stable_subset=use_stable_subset,
+            size_min_cutoff=args.online_size_min_cutoff,
+            size_beta=args.online_size_beta,
+            center_min_cutoff=args.online_center_cutoff,
+            center_beta=args.online_center_beta,
+        )
+
+    # --------------------------- shape freeze setup ----------------------------- #
+    # frozen_shape holds a (1, 300) tensor that overrides the per-frame prediction.
+    # shape_buffer accumulates shape_params during the online warm-up window.
+    frozen_shape = None
+    shape_buffer: list = []
+
+    if args.crop and args.freeze_shape and args.bbox_mode == 'offline':
+        # Pass 2 (offline + freeze): run SMIRK encoder on every smoothed crop to
+        # collect shape_params across the whole video, then take the median.
+        cap_shape = cv2.VideoCapture(args.input_path)
+        shape_idx = 0
+        with torch.no_grad():
+            while True:
+                ret, frame = cap_shape.read()
+                if not ret:
+                    break
+                tform_i = precomputed_tforms[shape_idx]
+                crop_i = warp(
+                    frame, tform_i.inverse, output_shape=(input_image_size, input_image_size),
+                    preserve_range=True,
+                ).astype(np.uint8)
+                crop_i = cv2.cvtColor(crop_i, cv2.COLOR_BGR2RGB)
+                crop_t = torch.from_numpy(crop_i).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                crop_t = crop_t.to(args.device)
+                out_i = smirk_encoder(crop_t)
+                shape_buffer.append(out_i['shape_params'].detach().cpu())
+                shape_idx += 1
+        cap_shape.release()
+        if shape_buffer:
+            stacked = torch.cat(shape_buffer, dim=0)  # (N, 300)
+            frozen_shape = torch.median(stacked, dim=0).values.unsqueeze(0).to(args.device)
+            shape_buffer = []
+
+    frame_idx = 0
+
     while True:
         ret, image = cap.read()
 
@@ -200,8 +399,14 @@ if __name__ == '__main__':
             
             kpt_mediapipe = kpt_mediapipe[..., :2]
 
-            tform = crop_face(image,kpt_mediapipe,scale=1.4,image_size=input_image_size)
-            
+            if args.bbox_mode == 'offline':
+                tform = precomputed_tforms[frame_idx]
+            elif args.bbox_mode == 'online':
+                tform, _, _ = bbox_tracker.update(kpt_mediapipe)
+            else:  # 'legacy'
+                tform = crop_face(image, kpt_mediapipe,
+                                  scale=args.bbox_scale, image_size=input_image_size)
+
             cropped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True).astype(np.uint8)
 
             cropped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe, np.ones([kpt_mediapipe.shape[0],1])]).T).T
@@ -217,6 +422,19 @@ if __name__ == '__main__':
         cropped_image = cropped_image.to(args.device)
 
         outputs = smirk_encoder(cropped_image)
+
+        if args.freeze_shape:
+            if frozen_shape is not None:
+                outputs['shape_params'] = frozen_shape
+            else:
+                # Online warm-up median. Keep per-frame shape during the window,
+                # switch to the frozen median once enough frames are buffered.
+                shape_buffer.append(outputs['shape_params'].detach())
+                if len(shape_buffer) >= args.freeze_shape_warmup_frames:
+                    stacked = torch.cat(shape_buffer, dim=0)  # (N, 300)
+                    frozen_shape = torch.median(stacked, dim=0).values.unsqueeze(0).to(args.device)
+                    outputs['shape_params'] = frozen_shape
+                    shape_buffer = []
 
         flame_output = flame.forward(outputs)
         renderer_output = renderer.forward(flame_output['vertices'], outputs['cam'],
@@ -248,7 +466,9 @@ if __name__ == '__main__':
                     pixels_full = crop_pixels * np.array([scale_x, scale_y])
                 right_panel = _draw_vertex_points(
                     right_panel, pixels_full,
-                    radius=args.vertex_radius, stride=args.vertex_stride,
+                    radius=args.vertex_radius,
+                    radius_rel=args.vertex_radius_rel,
+                    stride=args.vertex_stride,
                 )
             grid = torch.cat([full_image, right_panel], dim=3)
         else:
@@ -262,7 +482,9 @@ if __name__ == '__main__':
                 crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
                 right_panel = _draw_vertex_points(
                     right_panel, crop_pixels,
-                    radius=args.vertex_radius, stride=args.vertex_stride,
+                    radius=args.vertex_radius,
+                    radius_rel=args.vertex_radius_rel,
+                    stride=args.vertex_stride,
                 )
             grid = torch.cat([cropped_image, right_panel], dim=3)
 
@@ -320,6 +542,8 @@ if __name__ == '__main__':
         grid_numpy = grid_numpy.astype(np.uint8)
         grid_numpy = cv2.cvtColor(grid_numpy, cv2.COLOR_BGR2RGB)
         cap_out.write(grid_numpy)
+
+        frame_idx += 1
 
     cap.release()
     cap_out.release()
