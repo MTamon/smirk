@@ -124,6 +124,22 @@ MediaPipe FaceMesh の478点のうち、以下15点のみを bbox 算出に使�
 
 結果：`size = (right-left + bottom-top)/2` は「口を開けると縦に伸びる」挙動をしなくなる。
 
+### 3.1.1.1 `size_calibration`（補正係数）
+
+安定部分集合は**鉛直方向の extent が大幅に縮む**（鼻梁〜鼻先までで額も顎も含まない → フル顔の 1/3 程度）。`size = (width + height)/2` をそのまま使うと、stable-subset size はレガシー size の約 60% にしかならず、`--bbox_scale 1.4` を掛けても **顔の一部しか crop できない** ことが実運用で判明した。
+
+対策として `STABLE_LANDMARK_SIZE_CALIBRATION = 1.55`（定数）を stable-subset 時だけ `size` に掛けて、レガシーと同等の絶対サイズに戻している：
+
+```python
+size = ((width) + (height)) / 2 * cal      # cal = 1.55 when stable subset
+```
+
+- `--bbox_scale` の意味は変えない（legacy 1.4 のまま）
+- `--bbox_size_calibration` で override 可能。きつすぎ／緩すぎを感じたら調整
+- 値の根拠：安定 subset の `height_stable ≈ 0.3 * H_full`、`width_stable ≈ W_full` から `size_stable / size_full ≈ 0.65`、逆数の 1.55 を採用
+
+CLI で明示的に `1.0` を渡すと補正オフ（バグ観察用・旧実装の再現）。
+
 ### 3.1.2 One-Euro filter（オンライン用）
 
 CHI 2012 の手法そのままの実装：
@@ -208,6 +224,7 @@ median を使うのは外れ値（極端な表情・大回転・検出失敗）�
 |---|---|---|
 | `--bbox_mode` | `online` | バグ修正が主目的なので有効化がデフォルト |
 | `--bbox_all_landmarks` | off（安定subset使用） | 同上 |
+| `--bbox_size_calibration` | None（= 1.55） | 安定 subset の縮小を補正しレガシーと同じ crop サイズに揃える |
 | `--freeze_shape` | off | 人物依存な挙動変更なのでオプトイン |
 | `--online_center_cutoff` | None（平滑化なし） | 並進の遅延を出さないため |
 | `--offline_center_cutoff` | None | 同上 |
