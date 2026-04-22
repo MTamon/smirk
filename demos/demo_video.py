@@ -52,7 +52,7 @@ def _crop_pixels_to_full_pixels(crop_pixels, tform):
 
 
 def _draw_vertex_points(img_chw_tensor, pixels_xy,
-                        color_rgb=(0, 255, 255), radius=1, stride=1):
+                        color_rgb=(0, 255, 255), radius=1, radius_rel=None, stride=1):
     """Draw points at ``pixels_xy`` on ``img_chw_tensor``.
 
     Useful for inspecting head regions that the default face-only rasterizer
@@ -62,20 +62,42 @@ def _draw_vertex_points(img_chw_tensor, pixels_xy,
     ``color_rgb`` is interpreted in the same channel order as the input image
     (demos use RGB intermediate, then swap to BGR for the video writer), so
     (0, 255, 255) renders as cyan in the final mp4.
+
+    ``radius`` is the absolute radius in pixels. ``radius=0`` writes a single
+    pixel directly (no ``cv2.circle`` / no LINE_AA), which is the crispest
+    possible dot — useful on low-resolution videos where even radius=1 looks
+    large because LINE_AA bleeds across a 3x3 neighbourhood.
+
+    ``radius_rel``, if given, overrides ``radius`` and is interpreted as a
+    fraction of ``min(frame_h, frame_w)``. This lets the caller specify "dots
+    roughly 0.1% of the frame" once and get sensible sizes across 480p, 1080p,
+    and 4K inputs. Values that round down to 0 produce single-pixel dots.
     """
     _, _, h, w = img_chw_tensor.shape
+    if radius_rel is not None:
+        r = int(round(float(radius_rel) * min(h, w)))
+    else:
+        r = int(radius)
+    r = max(0, r)
+
     img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8).copy()
 
     pts = pixels_xy
     if stride > 1:
         pts = pts[::stride]
 
-    colour = tuple(int(v) for v in color_rgb)
-    r = int(max(1, radius))
-    for x, y in pts:
-        xi, yi = int(x), int(y)
-        if 0 <= xi < w and 0 <= yi < h:
-            cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
+    if r == 0:
+        colour_arr = np.array([int(v) for v in color_rgb], dtype=np.uint8)
+        for x, y in pts:
+            xi, yi = int(x), int(y)
+            if 0 <= xi < w and 0 <= yi < h:
+                img_np[yi, xi] = colour_arr
+    else:
+        colour = tuple(int(v) for v in color_rgb)
+        for x, y in pts:
+            xi, yi = int(x), int(y)
+            if 0 <= xi < w and 0 <= yi < h:
+                cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
 
     return (
         torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
@@ -126,7 +148,19 @@ if __name__ == '__main__':
                              'omits (ears, scalp, neck). Combine with --overlay to inspect '
                              'the full predicted shape against the real face.')
     parser.add_argument('--vertex_radius', type=int, default=1,
-                        help='Radius (px) for each vertex dot. Default 1.')
+                        help='Absolute radius (px) for each vertex dot. Pass 0 '
+                             'to draw a true single-pixel dot (no anti-aliasing), '
+                             'which is the crispest option on low-resolution '
+                             'videos where LINE_AA circles look fuzzy. Ignored '
+                             'when --vertex_radius_rel is set. Default 1.')
+    parser.add_argument('--vertex_radius_rel', type=float, default=None,
+                        help='Radius expressed as a fraction of '
+                             'min(frame_height, frame_width) on the panel that '
+                             'the dots are drawn on. E.g. 0.001 on a 1080p frame '
+                             '→ ~1 px; 0.0005 → single-pixel dot. Overrides '
+                             '--vertex_radius when set. Recommended over the '
+                             'absolute flag when comparing across videos of '
+                             'different resolutions.')
     parser.add_argument('--vertex_stride', type=int, default=1,
                         help='Stride when sampling the ~5023 FLAME vertices '
                              '(1 = every vertex; 2 = every other; etc.). Default 1.')
@@ -432,7 +466,9 @@ if __name__ == '__main__':
                     pixels_full = crop_pixels * np.array([scale_x, scale_y])
                 right_panel = _draw_vertex_points(
                     right_panel, pixels_full,
-                    radius=args.vertex_radius, stride=args.vertex_stride,
+                    radius=args.vertex_radius,
+                    radius_rel=args.vertex_radius_rel,
+                    stride=args.vertex_stride,
                 )
             grid = torch.cat([full_image, right_panel], dim=3)
         else:
@@ -446,7 +482,9 @@ if __name__ == '__main__':
                 crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
                 right_panel = _draw_vertex_points(
                     right_panel, crop_pixels,
-                    radius=args.vertex_radius, stride=args.vertex_stride,
+                    radius=args.vertex_radius,
+                    radius_rel=args.vertex_radius_rel,
+                    stride=args.vertex_stride,
                 )
             grid = torch.cat([cropped_image, right_panel], dim=3)
 
