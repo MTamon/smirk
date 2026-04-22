@@ -178,6 +178,12 @@ bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode legacy
   は元から `size` 信号に載らない → LPF カットオフを 2.5Hz まで下げても問題ない
 - **One-Euro filter の beta** で適応度を調整。`beta=0.02`（既定）は静止時に
   強平滑、急な距離変化でも低遅延で追従する
+- **`--bbox_size_calibration`**：安定 subset は鼻梁〜鼻先までしか鉛直 extent を
+  持たない（口・顎・額を除外しているため）ので、legacy と同じ `bbox_scale=1.4`
+  では顔の一部しか crop できない。`STABLE_LANDMARK_SIZE_CALIBRATION=1.55` を
+  `size` に掛けて legacy と同等の絶対 crop サイズに揃えている。きつすぎ／
+  緩すぎを感じたら `--bbox_size_calibration 1.4`（狭める）/ `1.7`（広げる）
+  のように調整してください。`1.0` でオフ（旧バグの再現）
 
 詳細な設計思想と周波数選択の根拠は `docs/bbox_stabilization.md` を参照。
 
@@ -222,6 +228,7 @@ bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode offline --fre
 | `--bbox_mode` | `online` | `legacy` / `online` / `offline` |
 | `--bbox_scale` | `1.4` | bbox パディング係数。旧値と同じ |
 | `--bbox_all_landmarks` | false | 指定時は旧挙動（478 点全て使用） |
+| `--bbox_size_calibration` | None（= 1.55） | 安定 subset の size を補正しレガシー crop と同等サイズに揃える |
 | `--online_size_min_cutoff` | `1.0` | One-Euro 最小カットオフ（Hz） |
 | `--online_size_beta` | `0.02` | One-Euro 速度感度 |
 | `--online_center_cutoff` | None | 指定時のみ center も One-Euro 平滑化 |

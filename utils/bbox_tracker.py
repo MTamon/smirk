@@ -52,27 +52,62 @@ STABLE_LANDMARK_INDICES = np.array(
     dtype=np.int64,
 )
 
+# Because the stable subset skips the mouth, jaw, eyebrows, and forehead, the
+# vertical extent of ``(top, bottom)`` over the subset is roughly one third of
+# the full-face extent (it is dominated by "nose root to nose tip"). Horizontal
+# extent is comparable to the full-face width since 234 / 454 are temple
+# points at the widest part of the face. Using the legacy
+# ``(width + height) / 2`` size formula on the stable subset therefore yields
+# a ``size`` about 60% of what the all-landmarks formula produced, and a
+# legacy ``--bbox_scale 1.4`` no longer covers the whole face.
+#
+# The calibration below rescales the stable-subset size so that the effective
+# crop matches what the legacy pipeline was trained on, keeping ``bbox_scale``
+# semantics unchanged across modes. Tuned empirically to make the average crop
+# visually match ``--bbox_mode legacy --bbox_scale 1.4``; adjust via
+# ``size_calibration=`` (function arg) or the ``--bbox_size_calibration`` CLI
+# flag if your footage crops too tight / too loose.
+STABLE_LANDMARK_SIZE_CALIBRATION = 1.55
+
 
 def extract_bbox_center_size(
     landmarks: np.ndarray,
     use_stable_subset: bool = True,
+    size_calibration: Optional[float] = None,
 ) -> Tuple[np.ndarray, float]:
     """Return ``(center_xy, size)`` with the same formula as ``crop_face``.
 
     ``size`` is the average of bbox width and height (matches the legacy
     ``old_size = (right - left + bottom - top) / 2`` convention). ``center``
-    is the bbox midpoint. When ``use_stable_subset`` is True, only the
-    speech/blink-invariant landmarks are used; the resulting size no longer
-    grows when the subject opens their mouth.
+    is the bbox midpoint.
+
+    When ``use_stable_subset`` is True, only the speech/blink-invariant
+    landmarks are used; the resulting size no longer grows when the subject
+    opens their mouth. A calibration factor (``size_calibration``) is applied
+    to compensate for the smaller vertical extent of the subset — without it,
+    the resulting crop would cover only the eye-to-nose region. Pass
+    ``size_calibration=None`` (the default) to use
+    ``STABLE_LANDMARK_SIZE_CALIBRATION``, or pass ``1.0`` to disable the
+    compensation entirely. The calibration is a no-op when
+    ``use_stable_subset=False``.
     """
-    pts = landmarks[STABLE_LANDMARK_INDICES] if use_stable_subset else landmarks
+    if use_stable_subset:
+        pts = landmarks[STABLE_LANDMARK_INDICES]
+        cal = (
+            STABLE_LANDMARK_SIZE_CALIBRATION
+            if size_calibration is None
+            else float(size_calibration)
+        )
+    else:
+        pts = landmarks
+        cal = 1.0
     xs = pts[:, 0]
     ys = pts[:, 1]
     left = float(np.min(xs))
     right = float(np.max(xs))
     top = float(np.min(ys))
     bottom = float(np.max(ys))
-    size = (right - left + bottom - top) / 2.0
+    size = ((right - left) + (bottom - top)) / 2.0 * cal
     center = np.array(
         [(left + right) / 2.0, (top + bottom) / 2.0], dtype=np.float64,
     )
@@ -229,6 +264,7 @@ class OnlineBBoxTracker:
         image_size: int = 224,
         scale: float = 1.4,
         use_stable_subset: bool = True,
+        size_calibration: Optional[float] = None,
         size_min_cutoff: float = 1.0,
         size_beta: float = 0.02,
         center_min_cutoff: Optional[float] = None,
@@ -238,6 +274,7 @@ class OnlineBBoxTracker:
         self.image_size = int(image_size)
         self.scale = float(scale)
         self.use_stable_subset = bool(use_stable_subset)
+        self.size_calibration = size_calibration
 
         self._size_filter = OneEuroFilter1D(
             freq=self.fps, min_cutoff=size_min_cutoff, beta=size_beta,
@@ -254,7 +291,9 @@ class OnlineBBoxTracker:
     def update(self, landmarks: np.ndarray):
         """Consume one frame's landmarks and return ``(tform, center, size)``."""
         center, size = extract_bbox_center_size(
-            landmarks, use_stable_subset=self.use_stable_subset,
+            landmarks,
+            use_stable_subset=self.use_stable_subset,
+            size_calibration=self.size_calibration,
         )
         size_s = self._size_filter(size)
         if self._smooth_center:

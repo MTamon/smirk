@@ -183,6 +183,14 @@ if __name__ == '__main__':
                              'behavior). By default only a speech/blink-invariant subset '
                              '(eye corners, nose bridge, temples) is used so the bbox '
                              'size does not grow when the mouth opens.')
+    parser.add_argument('--bbox_size_calibration', type=float, default=None,
+                        help='Multiplier applied to the stable-subset size to compensate '
+                             'for its smaller vertical extent (nose-only instead of '
+                             'forehead-to-chin). Default is the value in '
+                             'utils.bbox_tracker.STABLE_LANDMARK_SIZE_CALIBRATION '
+                             '(~1.55) which makes the average crop match '
+                             '--bbox_mode legacy. Pass 1.0 to disable. Ignored when '
+                             '--bbox_all_landmarks or --bbox_mode legacy is set.')
     parser.add_argument('--online_size_min_cutoff', type=float, default=1.0,
                         help='One-Euro min_cutoff (Hz) for the bbox-size filter in '
                              '--bbox_mode online. Default 1.0.')
@@ -304,6 +312,7 @@ if __name__ == '__main__':
                 exit()
             center_i, size_i = extract_bbox_center_size(
                 kpt[..., :2], use_stable_subset=use_stable_subset,
+                size_calibration=args.bbox_size_calibration,
             )
             raw_centers.append(center_i)
             raw_sizes.append(size_i)
@@ -342,6 +351,7 @@ if __name__ == '__main__':
         bbox_tracker = OnlineBBoxTracker(
             fps=video_fps, image_size=input_image_size, scale=args.bbox_scale,
             use_stable_subset=use_stable_subset,
+            size_calibration=args.bbox_size_calibration,
             size_min_cutoff=args.online_size_min_cutoff,
             size_beta=args.online_size_beta,
             center_min_cutoff=args.online_center_cutoff,
