@@ -15,8 +15,46 @@ from src.renderer.renderer import Renderer
 import argparse
 import src.utils.masking as masking_utils
 from utils.mediapipe_utils import run_mediapipe
-from datasets.base_dataset import create_mask
+from datasets.base_dataset import create_mask, mediapipe_indices
 import torch.nn.functional as F
+
+
+def _shift_image_2d(img_chw_tensor, dx_pixels, dy_pixels):
+    """Translate a (1, C, H, W) torch image by (dx, dy) pixels in screen space.
+
+    Used by --align_to_input to cancel the per-frame screen-space drift that
+    appears because SMIRK's weak-perspective `cam` only shifts in 2D while
+    FLAME LBS rotates the mesh around the neck joint J_root. The encoder's
+    saved (s, tx, ty) is left untouched; only the rasterized image is shifted
+    so the mesh overlays the input face during preview.
+    """
+    _, _, h, w = img_chw_tensor.shape
+    img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
+    M = np.float32([[1.0, 0.0, float(dx_pixels)], [0.0, 1.0, float(dy_pixels)]])
+    shifted = cv2.warpAffine(
+        img_np, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    return (
+        torch.from_numpy(shifted).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    ).to(img_chw_tensor.device)
+
+
+def _alignment_shift_pixels(rendered_landmarks_mp_ndc, input_landmarks_mp_pixel, image_size):
+    """Compute (dx, dy) in pixels to align rendered MP landmarks centroid to input.
+
+    rendered_landmarks_mp_ndc : torch.Tensor of shape (1, 105, 2) in custom NDC
+        as returned by Renderer (range roughly [-1, 1]).
+    input_landmarks_mp_pixel  : np.ndarray of shape (478, 2) in image-pixel
+        coordinates of the same crop. Subset by `mediapipe_indices` to align
+        with FLAME's 105-point MP embedding.
+    """
+    rendered = rendered_landmarks_mp_ndc.squeeze(0).detach().cpu().numpy()
+    rendered_pixel = (rendered + 1.0) * 0.5 * image_size
+    input_subset = input_landmarks_mp_pixel[mediapipe_indices, :2]
+    return input_subset.mean(axis=0) - rendered_pixel.mean(axis=0)
 
 
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
@@ -50,6 +88,13 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
+    parser.add_argument('--align_to_input', action='store_true',
+                        help='Visualization-only 2D shift of the rendered mesh so that '
+                             'its MediaPipe-landmark centroid matches the input crop. '
+                             'Cancels the per-frame screen-space drift caused by '
+                             'SMIRK rotating the FLAME mesh around J_root (neck) under '
+                             'a weak-perspective camera. Saved FLAME parameters are '
+                             'unaffected; only the displayed mesh moves. Requires --crop.')
 
     args = parser.parse_args()
 
@@ -147,22 +192,39 @@ if __name__ == '__main__':
         flame_output = flame.forward(outputs)
         renderer_output = renderer.forward(flame_output['vertices'], outputs['cam'],
                                             landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
-        
+
         rendered_img = renderer_output['rendered_img']
+
+        # Visualization-only translation. Keep the un-shifted ``rendered_img``
+        # for the smirk_generator path so its 6-channel input stays consistent
+        # with how the network was trained.
+        if args.align_to_input:
+            if not args.crop:
+                raise ValueError('--align_to_input requires --crop (input MediaPipe '
+                                 'landmarks must live in the same 224 crop frame as '
+                                 'the rendered mesh).')
+            shift = _alignment_shift_pixels(
+                renderer_output['landmarks_mp'],
+                cropped_kpt_mediapipe,
+                input_image_size,
+            )
+            rendered_img_display = _shift_image_2d(rendered_img, shift[0], shift[1])
+        else:
+            rendered_img_display = rendered_img
 
         if args.render_orig:
             if args.crop:
-                rendered_img_numpy = (rendered_img.squeeze(0).permute(1,2,0).detach().cpu().numpy()*255.0).astype(np.uint8)               
+                rendered_img_numpy = (rendered_img_display.squeeze(0).permute(1,2,0).detach().cpu().numpy()*255.0).astype(np.uint8)
                 rendered_img_orig = warp(rendered_img_numpy, tform, output_shape=(video_height, video_width), preserve_range=True).astype(np.uint8)
                 # back to pytorch to concatenate with full_image
                 rendered_img_orig = torch.Tensor(rendered_img_orig).permute(2,0,1).unsqueeze(0).float()/255.0
             else:
-                rendered_img_orig = F.interpolate(rendered_img, (video_height, video_width), mode='bilinear').cpu()
+                rendered_img_orig = F.interpolate(rendered_img_display, (video_height, video_width), mode='bilinear').cpu()
 
             full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2,0,1).unsqueeze(0).float()/255.0
             grid = torch.cat([full_image, rendered_img_orig], dim=3)
         else:
-            grid = torch.cat([cropped_image, rendered_img], dim=3)
+            grid = torch.cat([cropped_image, rendered_img_display], dim=3)
 
         # ---- create the neural renderer reconstructed img ---- #
         if args.use_smirk_generator:

@@ -57,6 +57,7 @@ FLAME のユーザ名・パスワードを対話で聞かれます（flame.is.tu
 |---|---|---|
 | `demo.py` | 単一画像→メッシュ重ね描き | `bash demos/run_demo.sh --input_path samples/test_image1.png --crop` |
 | `demo_video.py` | 動画ファイル→並置描画 mp4 | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop` |
+| 〃 `--align_to_input` | 表示時にメッシュを入力顔中心に整列（§1.1） | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --align_to_input` |
 | `demo_save_flame.py` | 動画→FLAME パラメータ .pt 保存（描画なし） | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark` |
 | 〃 `--with_eye_pose` | + MediaPipe blendshape 由来の eyes_pose / eyelids 追加 | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --with_eye_pose --benchmark --mp_delegate gpu` |
 | `demo_webcam.py` | Web カメラ→リアルタイム推論＋メッシュ重畳 | `bash demos/run_demo_webcam.sh` |
@@ -74,6 +75,51 @@ python demos/demo_webcam.py --mp_delegate gpu
 もそのまま動きます（各 Python ファイル先頭に `sys.path` ブートストラップが
 入っているので呼び出し CWD に依存しません）。ただし **GPU delegate を
 実際に効かせるには §A.5 の環境変数を先にセットする必要があります**。
+
+### 1.1 `--align_to_input`: 並置プレビューでメッシュが回転中に滑って見える件
+
+**症状**：`demo_video.py --crop` の右半分（描画メッシュ）が、入力動画で
+頭部が回転するときに、まるで**回転中心の前後に取り付いた振り子**のように
+左右へスライドする。正面付近では一致しているのに、横顔で顔メッシュが
+画面内を移動して見える。
+
+**原因（仕様）**：
+
+- SMIRK encoder は `(s, tx, ty)` の 2D weak-perspective camera と
+  axis-angle global pose `pose_params` を出力する。
+- FLAME LBS (`src/FLAME/lbs.py`) は `pose_params` を **root joint
+  `J_root`（首基部）まわりの回転** として正しく適用する：
+  `v_lbs = R @ (v_rest − J_root) + J_root`。
+- レンダラ (`src/renderer/renderer.py:100` の `batch_orth_proj`) は
+  `(s, tx, ty)` で 2D シフトとスケールしか行えないので、`J_root` と
+  「画面上で人間が "顔の中心" だと感じる点」の Z 距離は補正できない。
+- 結果として、頭部が yaw/pitch すると `(face_center − J_root)` の
+  腕の長さ分だけメッシュが画面内で円弧運動する。**SMIRK 本体や FLAME に
+  実装バグはない** — weak-perspective + canonical FLAME 幾何の構造的限界。
+
+**`--align_to_input` がやること**：
+
+各フレームで描画後に、
+
+1. レンダラが返す `landmarks_mp` (FLAME 105 点 mediapipe 埋め込み) を
+   224 ピクセル空間に変換した centroid を取る
+2. 入力 mediapipe 478 点を `datasets/base_dataset.py:18` の
+   `mediapipe_indices` で同じ 105 点に subset し、その centroid と比較
+3. ピクセル空間の差分 `(dx, dy)` を `cv2.warpAffine` で **rendered_img だけ**
+   に適用
+
+**保存される `.pt`（`demo_save_flame.py` 経由の `cam` を含む）には一切
+影響しない**。`smirk_generator` の入力にも影響させない（並置プレビュー
+専用の visualization patch）。`--crop` 必須。
+
+**いつ使うか**：
+
+- ✅ 正面以外を含む動画で、メッシュ品質を見たいとき。`(tx, ty)` 残差を
+  キャンセルすると、ジョー・表情・視線の妥当性を腰を据えて評価できる
+- ❌ encoder が予測した `(tx, ty)` の精度を評価したいときは外す（シフトで
+  隠れてしまう）
+- ❌ 下流で `cam` をそのまま使う前提のとき（`smirk_convert.py` 経由など）は
+  保存される値とプレビューが一致するよう外しておく方が混乱が少ない
 
 ### ステップ A.5. シェルラッパ経由で実行する理由（重要）
 
