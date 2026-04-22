@@ -164,6 +164,21 @@ if __name__ == '__main__':
     parser.add_argument('--vertex_stride', type=int, default=1,
                         help='Stride when sampling the ~5023 FLAME vertices '
                              '(1 = every vertex; 2 = every other; etc.). Default 1.')
+    parser.add_argument('--show_mp_landmarks', action='store_true',
+                        help='Overlay MediaPipe face landmarks for diagnosis. '
+                             'Draws two uniformly-distributed 478-point sets on '
+                             'the right panel: YELLOW = actual MP detection from '
+                             'the input frame (= ground truth face extent), '
+                             'RED = SMIRK-predicted FLAME landmarks_mp projected '
+                             'to the same pixel space. If RED matches YELLOW, '
+                             'the model prediction and the NDC→pixel→original '
+                             'pipeline are correct — any perceived size gap '
+                             'between the green --show_vertices cloud and the '
+                             'visible face is then just FLAME\'s vertex-density '
+                             'distribution (71%% of vertices pack the central '
+                             'face; only ~3%% reach the scalp), not a drawing '
+                             'bug. If RED is smaller than YELLOW, SMIRK is '
+                             'under-predicting cam_scale for this framing.')
 
     parser.add_argument('--bbox_mode', type=str, default='online',
                         choices=['legacy', 'online', 'offline'],
@@ -485,6 +500,24 @@ if __name__ == '__main__':
                     radius_rel=args.vertex_radius_rel,
                     stride=args.vertex_stride,
                 )
+            if args.show_mp_landmarks:
+                pred_crop = _ndc_to_crop_pixels(renderer_output['landmarks_mp'], input_image_size)
+                if args.crop:
+                    pred_full = _crop_pixels_to_full_pixels(pred_crop, tform)
+                    gt_full = kpt_mediapipe
+                else:
+                    scale_x = video_width / float(input_image_size)
+                    scale_y = video_height / float(input_image_size)
+                    pred_full = pred_crop * np.array([scale_x, scale_y])
+                    gt_full = kpt_mediapipe
+                right_panel = _draw_vertex_points(
+                    right_panel, gt_full, color_rgb=(255, 255, 0),
+                    radius=args.vertex_radius, radius_rel=args.vertex_radius_rel,
+                )
+                right_panel = _draw_vertex_points(
+                    right_panel, pred_full, color_rgb=(255, 0, 0),
+                    radius=args.vertex_radius, radius_rel=args.vertex_radius_rel,
+                )
             grid = torch.cat([full_image, right_panel], dim=3)
         else:
             if args.overlay:
@@ -500,6 +533,17 @@ if __name__ == '__main__':
                     radius=args.vertex_radius,
                     radius_rel=args.vertex_radius_rel,
                     stride=args.vertex_stride,
+                )
+            if args.show_mp_landmarks:
+                pred_crop = _ndc_to_crop_pixels(renderer_output['landmarks_mp'], input_image_size)
+                gt_crop = cropped_kpt_mediapipe if args.crop else kpt_mediapipe
+                right_panel = _draw_vertex_points(
+                    right_panel, gt_crop, color_rgb=(255, 255, 0),
+                    radius=args.vertex_radius, radius_rel=args.vertex_radius_rel,
+                )
+                right_panel = _draw_vertex_points(
+                    right_panel, pred_crop, color_rgb=(255, 0, 0),
+                    radius=args.vertex_radius, radius_rel=args.vertex_radius_rel,
                 )
             grid = torch.cat([cropped_image, right_panel], dim=3)
 
