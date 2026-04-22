@@ -57,6 +57,7 @@ FLAME のユーザ名・パスワードを対話で聞かれます（flame.is.tu
 |---|---|---|
 | `demo.py` | 単一画像→メッシュ重ね描き | `bash demos/run_demo.sh --input_path samples/test_image1.png --crop` |
 | `demo_video.py` | 動画ファイル→並置描画 mp4 | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop` |
+| 〃 `--overlay` | 右パネルを alpha blend 重畳にする（§1.1） | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay` |
 | 〃 `--align_to_input` | 表示時にメッシュを入力顔中心に整列（§1.1） | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --align_to_input` |
 | `demo_save_flame.py` | 動画→FLAME パラメータ .pt 保存（描画なし） | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark` |
 | 〃 `--with_eye_pose` | + MediaPipe blendshape 由来の eyes_pose / eyelids 追加 | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --with_eye_pose --benchmark --mp_delegate gpu` |
@@ -76,7 +77,24 @@ python demos/demo_webcam.py --mp_delegate gpu
 入っているので呼び出し CWD に依存しません）。ただし **GPU delegate を
 実際に効かせるには §A.5 の環境変数を先にセットする必要があります**。
 
-### 1.1 `--align_to_input`: 並置プレビューでメッシュが回転中に滑って見える件
+### 1.1 `--overlay` と `--align_to_input`: プレビューの見やすさを上げる二つの補助
+
+既定では `demo_video.py --crop` は `[入力 crop | 真っ黒背景に描画したメッシュ]`
+という並置 mp4 を書きます。`--overlay` と `--align_to_input` はどちらも
+**保存される FLAME パラメータを変えずに**、プレビュー映像の見やすさだけを
+上げるためのフラグです。
+
+#### `--overlay`: メッシュを alpha blend で入力にかぶせる
+
+右パネルの真っ黒背景をやめて、描画メッシュの**非黒ピクセルだけを alpha 合成**
+で入力 crop（`--render_orig` 併用時は原画）に重畳します。`--overlay_alpha`
+（デフォルト `0.55`）で透過率を調整。これでメッシュが入力顔のどこに
+どれくらいフィットしているかを直接見ることができます。
+
+`--use_smirk_generator` と組み合わせてもジェネレータ入力（6ch 画像）には
+影響しません — 生成ネットは引き続き無改変の `rendered_img` を受け取ります。
+
+#### `--align_to_input`: 回転時のスクリーン空間スイングを打ち消す
 
 **症状**：`demo_video.py --crop` の右半分（描画メッシュ）が、入力動画で
 頭部が回転するときに、まるで**回転中心の前後に取り付いた振り子**のように

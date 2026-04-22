@@ -52,6 +52,14 @@ def _alignment_shift_pixels(rendered_landmarks_mp_ndc, input_landmarks_mp_pixel,
     return input_subset.mean(axis=0) - rendered_pixel.mean(axis=0)
 
 
+def _alpha_blend_mesh_over_input(input_img_chw, rendered_img_chw, alpha):
+    """Alpha-blend ``rendered_img_chw`` over ``input_img_chw`` where the mesh is
+    non-black. Both tensors are (1, 3, H, W) in [0, 1]."""
+    mesh_mask = (rendered_img_chw.sum(dim=1, keepdim=True) > 1e-3).float()
+    effective_alpha = mesh_mask * float(alpha)
+    return input_img_chw * (1.0 - effective_alpha) + rendered_img_chw * effective_alpha
+
+
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
     left = np.min(landmarks[:, 0])
     right = np.max(landmarks[:, 0])
@@ -89,6 +97,13 @@ if __name__ == '__main__':
                              'screen-space drift from SMIRK rotating the FLAME mesh around '
                              'J_root under a weak-perspective camera. Saved FLAME parameters '
                              'are unaffected; only the displayed mesh moves. Requires --crop.')
+    parser.add_argument('--overlay', action='store_true',
+                        help='Draw the rendered mesh alpha-blended on top of the input '
+                             'frame instead of side-by-side. Lets you judge fit quality '
+                             'directly.')
+    parser.add_argument('--overlay_alpha', type=float, default=0.55,
+                        help='Alpha for the mesh in --overlay mode (0=input only, '
+                             '1=mesh only). Default 0.55.')
 
     args = parser.parse_args()
 
@@ -185,9 +200,19 @@ if __name__ == '__main__':
             rendered_img_orig = F.interpolate(rendered_img_display, (orig_image_height, orig_image_width), mode='bilinear').cpu()
 
         full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2,0,1).unsqueeze(0).float()/255.0
-        grid = torch.cat([full_image, rendered_img_orig], dim=3)
+        right_panel = (
+            _alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
+            if args.overlay else rendered_img_orig
+        )
+        grid = torch.cat([full_image, right_panel], dim=3)
     else:
-        grid = torch.cat([cropped_image, rendered_img_display], dim=3)
+        if args.overlay:
+            right_panel = _alpha_blend_mesh_over_input(
+                cropped_image, rendered_img_display, args.overlay_alpha
+            )
+        else:
+            right_panel = rendered_img_display
+        grid = torch.cat([cropped_image, right_panel], dim=3)
 
 
     # ---- create the neural renderer reconstructed img ---- #
