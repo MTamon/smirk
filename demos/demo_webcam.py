@@ -71,9 +71,15 @@ import numpy as np
 import torch
 
 from src.smirk_encoder import SmirkEncoder
+from utils.bbox_tracker import OnlineBBoxTracker
 from utils.face_crop import fast_crop_face_bgr
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
 from utils.eye_pose import estimate_eye_pose_and_eyelid
+from utils.vertex_viz import (
+    add_vertex_viz_args,
+    draw_vertex_points_bgr,
+    ndc_to_crop_pixels,
+)
 
 
 def load_encoder(checkpoint_path, device):
@@ -179,7 +185,12 @@ class CaptureThread:
 
 
 def render_mesh(flame, renderer, outputs, device):
-    """Run FLAME + Renderer and return a (224,224,3) uint8 BGR image."""
+    """Run FLAME + Renderer.
+
+    Returns ``(mesh_bgr, ren_out)`` where ``mesh_bgr`` is a (224, 224, 3)
+    uint8 BGR image and ``ren_out`` is the raw renderer dict (needed for
+    ``transformed_vertices`` when ``--show_vertices`` is on).
+    """
     flame_out = flame.forward(outputs)
     ren_out = renderer.forward(
         flame_out['vertices'], outputs['cam'],
@@ -189,7 +200,21 @@ def render_mesh(flame, renderer, outputs, device):
     img = ren_out['rendered_img']  # (1,3,H,W) in [0,1]
     img = (img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    return img
+    return img, ren_out
+
+
+def _alpha_blend_mesh_over_crop_bgr(crop_bgr, mesh_bgr, alpha):
+    """Alpha-blend ``mesh_bgr`` over ``crop_bgr`` wherever the mesh is non-black.
+
+    Both are (H, W, 3) uint8 BGR; returns a new uint8 BGR array. Channel
+    order does not matter for the mask or the blend math, so this mirrors
+    ``utils.vertex_viz.alpha_blend_mesh_over_input`` without the torch
+    round-trip.
+    """
+    mesh_mask = (mesh_bgr.astype(np.int32).sum(axis=2, keepdims=True) > 3).astype(np.float32)
+    eff_alpha = mesh_mask * float(alpha)
+    blended = crop_bgr.astype(np.float32) * (1.0 - eff_alpha) + mesh_bgr.astype(np.float32) * eff_alpha
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def main():
@@ -294,6 +319,57 @@ def main():
                         help='MediaPipe Tasks inference delegate. GPU '
                              'requires a MediaPipe build with OpenGL ES '
                              'support; falls back to CPU on init failure.')
+
+    # ---- visualization (overlay / show_vertices) ---- #
+    add_vertex_viz_args(parser)
+
+    # ---- bbox stabilization (online only; offline is not meaningful live) ---- #
+    parser.add_argument('--bbox_mode', type=str, default='online',
+                        choices=['legacy', 'online'],
+                        help='How to derive the per-frame face bbox. '
+                             '"legacy" = min/max over every MediaPipe landmark '
+                             'with no temporal filtering (same as the original '
+                             'webcam demo). "online" = stable-landmark subset + '
+                             'One-Euro low-pass on bbox size (O(1) state). '
+                             'Default "online".')
+    parser.add_argument('--bbox_scale', type=float, default=1.4,
+                        help='Padding multiplier around the landmark bbox. '
+                             'Same semantics as demo_video.py. Default 1.4.')
+    parser.add_argument('--bbox_all_landmarks', action='store_true',
+                        help='Use every MediaPipe landmark for the bbox '
+                             'instead of the speech/blink-invariant subset. '
+                             'Applies only to --bbox_mode online.')
+    parser.add_argument('--bbox_size_calibration', type=float, default=None,
+                        help='Multiplier applied to the stable-subset size to '
+                             'match legacy crop extent. None = module default '
+                             '(~1.55). Pass 1.0 to disable. Ignored under '
+                             '--bbox_all_landmarks or --bbox_mode legacy.')
+    parser.add_argument('--online_size_min_cutoff', type=float, default=1.0,
+                        help='One-Euro min_cutoff (Hz) for bbox size filter. '
+                             'Default 1.0.')
+    parser.add_argument('--online_size_beta', type=float, default=0.02,
+                        help='One-Euro beta (speed sensitivity) for bbox size '
+                             'filter. Default 0.02.')
+    parser.add_argument('--online_center_cutoff', type=float, default=None,
+                        help='If set, also One-Euro-filter the bbox center with '
+                             'this min_cutoff (Hz). Usually leave unset so head '
+                             'translation tracks fast motion faithfully.')
+    parser.add_argument('--online_center_beta', type=float, default=0.02,
+                        help='One-Euro beta for bbox center filter (only used '
+                             'when --online_center_cutoff is set). Default 0.02.')
+
+    # ---- identity freeze (online warm-up only for live webcam) ---- #
+    parser.add_argument('--freeze_shape', action='store_true',
+                        help='Lock the predicted FLAME shape (identity) '
+                             'parameters after a warm-up window: collect '
+                             'shape_params for --freeze_shape_warmup_frames '
+                             'frames, take their median, then override all '
+                             'subsequent predictions with it. Useful when the '
+                             'subject stays in frame long enough to calibrate.')
+    parser.add_argument('--freeze_shape_warmup_frames', type=int, default=45,
+                        help='Warm-up length (frames) for --freeze_shape. '
+                             'Default 45 (~1.5 s at 30 fps).')
+
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu')
@@ -391,6 +467,28 @@ def main():
 
     os.makedirs(args.snapshot_dir, exist_ok=True)
 
+    # ---- bbox stabilization state ---- #
+    # "legacy" keeps fast_crop_face_bgr (raw all-landmark min/max, no filter).
+    # "online" wires OnlineBBoxTracker. ``actual_fps`` is the camera's reported
+    # rate (0 for ideal-video mode); we fall back to 30 Hz when unknown so the
+    # One-Euro filter has a sensible freq estimate.
+    bbox_tracker = None
+    if not args.capture_only and args.bbox_mode == 'online':
+        tracker_fps = actual_fps if actual_fps and actual_fps > 0 else 30.0
+        bbox_tracker = OnlineBBoxTracker(
+            fps=tracker_fps, image_size=224, scale=args.bbox_scale,
+            use_stable_subset=not args.bbox_all_landmarks,
+            size_calibration=args.bbox_size_calibration,
+            size_min_cutoff=args.online_size_min_cutoff,
+            size_beta=args.online_size_beta,
+            center_min_cutoff=args.online_center_cutoff,
+            center_beta=args.online_center_beta,
+        )
+
+    # ---- identity freeze state ---- #
+    frozen_shape: torch.Tensor | None = None
+    shape_buffer: list[torch.Tensor] = []
+
     fps_window = deque(maxlen=30)
     frame_idx = 0
     # Aggregate per-stage sums (seconds) for the final summary print.
@@ -423,6 +521,8 @@ def main():
             face_ok = False
             mesh_img = None
             outputs = None
+            ren_out = None
+            cropped_bgr = None
             eyes_pose_np = None
             eyelids_np = None
 
@@ -446,7 +546,24 @@ def main():
                 if face_ok:
                     # --- Preprocess (warp + cvtColor + to-device transfer) ---
                     t_pre0 = time.perf_counter()
-                    cropped_bgr = fast_crop_face_bgr(frame, landmarks, scale=1.4, image_size=224)
+                    if bbox_tracker is not None:
+                        # OnlineBBoxTracker returns a skimage similarity tform;
+                        # slice its forward 3x3 .params to a 2x3 float32 matrix
+                        # so cv2.warpAffine can consume it (same fast path as
+                        # fast_crop_face_bgr's internal call).
+                        tform, _, _ = bbox_tracker.update(landmarks)
+                        M = tform.params[:2, :].astype(np.float32)
+                        cropped_bgr = cv2.warpAffine(
+                            frame, M, (224, 224),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=(0, 0, 0),
+                        )
+                    else:
+                        cropped_bgr = fast_crop_face_bgr(
+                            frame, landmarks,
+                            scale=args.bbox_scale, image_size=224,
+                        )
                     cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
                     tensor = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                     tensor = tensor.to(device, non_blocking=True)
@@ -462,6 +579,25 @@ def main():
                         torch.cuda.synchronize()
                     timings['enc'] = (time.perf_counter() - t_enc0) * 1000.0
 
+                    # --- Shape freeze (online warm-up median) ---
+                    # Update both ``shape_params`` (consumed by FLAME.forward)
+                    # and ``shape`` (the FLARE-compatible alias read by the
+                    # save path) so the NDJSON log matches the frozen mesh.
+                    if args.freeze_shape:
+                        if frozen_shape is not None:
+                            outputs['shape_params'] = frozen_shape
+                            outputs['shape'] = frozen_shape
+                        else:
+                            shape_buffer.append(outputs['shape_params'].detach())
+                            if len(shape_buffer) >= args.freeze_shape_warmup_frames:
+                                stacked = torch.cat(shape_buffer, dim=0)
+                                frozen_shape = torch.median(stacked, dim=0).values.unsqueeze(0).to(device)
+                                outputs['shape_params'] = frozen_shape
+                                outputs['shape'] = frozen_shape
+                                shape_buffer = []
+                                print(f'[demo_webcam] --freeze_shape: identity locked after '
+                                      f'{args.freeze_shape_warmup_frames} frames')
+
                     if args.with_eye_pose:
                         ep, el = estimate_eye_pose_and_eyelid(blendshapes, device='cpu')
                         eyes_pose_np = ep.squeeze(0).numpy()
@@ -470,7 +606,7 @@ def main():
                     # --- Render (optional) ---
                     if not args.no_render:
                         t_ren0 = time.perf_counter()
-                        mesh_img = render_mesh(flame, renderer, outputs, device)
+                        mesh_img, ren_out = render_mesh(flame, renderer, outputs, device)
                         timings['ren'] = (time.perf_counter() - t_ren0) * 1000.0
 
                     if save_fp is not None:
@@ -494,7 +630,31 @@ def main():
             scale = display_h / orig_h
             webcam_disp = cv2.resize(frame, (int(orig_w * scale), display_h))
             if mesh_img is not None:
-                mesh_disp = cv2.resize(mesh_img, (display_h, display_h))
+                # Build the right panel at 224x224 in BGR, then resize once
+                # for display. This matches demo_video.py's non-render_orig
+                # behavior: overlay / vertex-scatter happens in crop space
+                # (224x224) so the user sees the same visualization surface
+                # regardless of webcam resolution.
+                if args.overlay and cropped_bgr is not None:
+                    right_panel_bgr = _alpha_blend_mesh_over_crop_bgr(
+                        cropped_bgr, mesh_img, args.overlay_alpha,
+                    )
+                else:
+                    right_panel_bgr = mesh_img.copy() if args.show_vertices else mesh_img
+                if args.show_vertices and ren_out is not None:
+                    crop_pixels = ndc_to_crop_pixels(
+                        ren_out['transformed_vertices'], 224,
+                    )
+                    # BGR cyan = (255, 255, 0) — matches the RGB (0, 255, 255)
+                    # used by demo_video.py after its RGB->BGR cvtColor step.
+                    draw_vertex_points_bgr(
+                        right_panel_bgr, crop_pixels,
+                        color_bgr=(255, 255, 0),
+                        radius=args.vertex_radius,
+                        radius_rel=args.vertex_radius_rel,
+                        stride=args.vertex_stride,
+                    )
+                mesh_disp = cv2.resize(right_panel_bgr, (display_h, display_h))
                 canvas = np.hstack([webcam_disp, mesh_disp])
             else:
                 canvas = webcam_disp

@@ -62,6 +62,9 @@ FLAME のユーザ名・パスワードを対話で聞かれます（flame.is.tu
 | `demo_save_flame.py` | 動画→FLAME パラメータ .pt 保存（描画なし） | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark` |
 | 〃 `--with_eye_pose` | + MediaPipe blendshape 由来の eyes_pose / eyelids 追加 | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --with_eye_pose --benchmark --mp_delegate gpu` |
 | `demo_webcam.py` | Web カメラ→リアルタイム推論＋メッシュ重畳 | `bash demos/run_demo_webcam.sh` |
+| 〃 `--overlay --show_vertices` | メッシュを crop に alpha 重畳＋5023 頂点を点群描画（§1.4） | `bash demos/run_demo_webcam.sh --overlay --show_vertices` |
+| 〃 `--bbox_mode legacy` | `demo_video.py --bbox_mode legacy` と同等の旧 crop 挙動 | `bash demos/run_demo_webcam.sh --bbox_mode legacy` |
+| 〃 `--freeze_shape` | 45 フレームで median を取って identity を凍結（§1.4） | `bash demos/run_demo_webcam.sh --freeze_shape` |
 | 〃 `--no_render` | CPU/GPU スループット計測専用 | `bash demos/run_demo_webcam.sh --device cpu --no_render --mp_delegate cpu` |
 
 `prepare_demos.sh` 末尾にも同じコマンド一覧が表示されます。
@@ -108,20 +111,20 @@ FLAME の `face` マスクに含まれる三角形だけを rasterize します�
 描画します。
 
 ```bash
-# メッシュ + 点群
+# メッシュ + 点群（デフォルトは --vertex_radius 0 = 1 ピクセル直接代入）
 bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --show_vertices
 
 # 実映像に重畳しつつ点群も併せる（耳の形状が最も確認しやすい）
 bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices
 
-# 点を大きくして見やすく
-bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius 2
+# 点を大きくして見やすく（LINE_AA 円で radius=1 は実質 3×3 の blob）
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius 1
+
+# さらに大きく（原寸大解像度なら radius=2〜3 程度が見やすい）
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --render_orig --vertex_radius 2
 
 # 点数を間引いて密度を下げる（5023 頂点 → stride=4 で約 1256 点）
 bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_stride 4
-
-# 1 ピクセル点（LINE_AA なしの直接代入）。低解像度動画で最も目立たない
-bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius 0
 
 # 動画解像度に対する相対サイズ（短辺の 0.1% = 1080p なら ~1px、4K なら ~2px）
 bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius_rel 0.001
@@ -134,16 +137,24 @@ bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --s
 - `--render_orig` 併用時は crop→原画の similarity transform `tform.inverse`
   を使って原画ピクセル空間に lift してから描画します
 - 保存される `.pt`・FLAME パラメータには影響しません（描画専用）
-- **点サイズの選び方**：
-  - `--vertex_radius 0` は `cv2.circle` も LINE_AA も経由せず 1 ピクセルを
-    直接代入するため、低解像度動画で最もクリスプな描画になります。
-    `--vertex_radius 1` は LINE_AA で実質 3×3 のにじみになるので
-    「1 px でも大きすぎる」と感じる場合に `0` を試してください
+- **点サイズの選び方（デフォルト = `0`）**：
+  - `demo_video.py` / `demo.py` / `demo_webcam.py` のいずれも `--vertex_radius`
+    のデフォルトは **`0`** です（以前は `1`）。5023 頂点を 224×224 のパネルに
+    描画するため、`cv2.circle(..., radius=1, LINE_AA)` は実質 3×3 の滲みに
+    なって点同士が重なってしまい、個々の頂点位置が判別しづらくなる問題が
+    ありました。`--vertex_radius 0` では `cv2.circle` も LINE_AA も経由せず
+    1 ピクセルを直接書き込むため、クリスプな点群として可視化できます
+  - 大きな点が欲しい場合は `--vertex_radius 1`（約 3×3 の AA blob）や
+    `--vertex_radius 2` を指定してください。原寸大解像度でレンダする
+    `--render_orig` と併用するときは 2〜3 px が見やすくなります
   - `--vertex_radius_rel` は描画パネルの短辺 `min(h, w)` に対する比率で半径を
     指定します。0.001 で 1080p なら ~1 px、640x480 なら 0.48 → 丸めて 0
     （= 1 ピクセル直接代入）になります。異なる解像度の動画を同じスクリプト
     で比較するときはこちらを使うと見た目が揃います
   - 両方指定された場合は `--vertex_radius_rel` が優先されます
+- **共通実装**：`--overlay` / `--show_vertices` / `--vertex_*` は
+  `utils/vertex_viz.py` に集約されており、`demo.py` / `demo_video.py` /
+  `demo_webcam.py` の 3 デモで同じフラグ名・同じ挙動で使えます
 
 ### 1.3 `--bbox_mode`: FLAME mesh の jitter を抑える bbox 時間安定化
 
@@ -238,6 +249,53 @@ bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode offline --fre
 | `--offline_center_cutoff` | None | 指定時のみ center も LPF |
 | `--freeze_shape` | false | shape 凍結オプトイン |
 | `--freeze_shape_warmup_frames` | `45` | online 時の warm-up 長 |
+
+### 1.4 `demo_webcam.py` への機能移植（overlay / show_vertices / bbox_mode / freeze_shape）
+
+`demo_video.py` に加わった可視化・安定化まわりの新機能は、ほぼ全て
+`demo_webcam.py`（Web カメラ／ideal-source 動画）でも同じフラグで使えます。
+共通実装は `utils/vertex_viz.py` にまとまっており、可視化の挙動は 3 デモ
+すべてで揃っています。
+
+| フラグ | `demo_webcam.py` の挙動 |
+|---|---|
+| `--overlay` / `--overlay_alpha` | 右パネル（メッシュ側）をクロップ面に対する alpha blend に差し替え。実映像全体への重畳ではなく、224×224 の crop 上でメッシュを半透明合成したものをリサイズして右側に出すので、GUI フレームレートに影響しない |
+| `--show_vertices` | 右パネルに FLAME 5023 頂点をシアン点群描画。`draw_vertex_points_bgr` の高速パス（BGR 直接書き込み、torch ラウンドトリップなし）を使用 |
+| `--vertex_radius` / `--vertex_radius_rel` / `--vertex_stride` | `demo_video.py` と同じ意味。既定 `--vertex_radius 0`（1 ピクセル直接代入） |
+| `--bbox_mode` | `online`（既定）/ `legacy` の 2 択（webcam では `offline` 非対応）。`online` は `OnlineBBoxTracker` + One-Euro LPF で stable landmark subset から crop を生成、`legacy` は以前と同じ `fast_crop_face_bgr`（全ランドマーク min/max、平滑化なし）に戻す |
+| `--bbox_scale` / `--bbox_all_landmarks` / `--bbox_size_calibration` | `demo_video.py` と同一。`legacy` モードでも `--bbox_scale` は効く（`fast_crop_face_bgr` に渡る）|
+| `--online_size_min_cutoff` / `--online_size_beta` / `--online_center_cutoff` / `--online_center_beta` | One-Euro フィルタ パラメタ。Webcam 実 FPS（`cv2.CAP_PROP_FPS`、不明時は 30Hz）を freq に使う |
+| `--freeze_shape` / `--freeze_shape_warmup_frames` | online warm-up median のみ（offline 事前パスは live webcam では無効）。warm-up 終了時に `[demo_webcam] --freeze_shape: identity locked after N frames` と stdout に出るので、`--save_path` で NDJSON 保存している場合はそのタイミング以降の `shape` が固定値になっていることを確認できる（`shape_params` と FLARE alias `shape` の両方が同時に上書きされる）|
+
+代表的な組合せ：
+
+```bash
+# メッシュを顔に重ねて表示しつつ、耳・頭頂の頂点も点群で確認したい
+bash demos/run_demo_webcam.sh --overlay --show_vertices
+
+# 旧挙動（DECA 互換 / A/B 比較）
+bash demos/run_demo_webcam.sh --bbox_mode legacy
+
+# 同一人物を長時間録る前提で identity を凍結（~1.5 s warm-up）
+bash demos/run_demo_webcam.sh --freeze_shape
+
+# 重いシーンでバッファに溜まる古いフレームを捨てつつ、点群のサイズを
+# 画面解像度に依存しないよう相対指定
+bash demos/run_demo_webcam.sh --capture_thread --show_vertices --vertex_radius_rel 0.0005
+```
+
+**設計メモ**：
+
+- Webcam では offline bbox モードは pre-pass が張れないため非対応（引数
+  choices から除外）。品質最優先のバッチ処理が必要なら録画を `demo_video.py
+  --bbox_mode offline` に回す構成を推奨
+- `--show_vertices` の描画は crop 空間 (224×224) で行い、そのあとに
+  `cv2.resize` で display_h × display_h に拡大してから右パネルに出します。
+  つまり `demo_video.py` の非 `--render_orig` と同じ挙動です。描画サーフェス
+  を小さく保つことで GUI フレームレートが落ちないようになっています
+- `--overlay` は `alpha_blend_mesh_over_crop_bgr`（BGR uint8 で直接 blend、
+  torch ラウンドトリップなし）で実装。CPU 負荷は 224×224 の alpha blend 1 回
+  分なので、どのプリセットでも `disp` ステージの計測に埋没します
 
 ### ステップ A.5. シェルラッパ経由で実行する理由（重要）
 
@@ -691,6 +749,8 @@ bash demos/run_demo_webcam.sh
 - `CAP_PROP_AUTO_EXPOSURE` は **触らない**（auto 再アサインが halving のもう一因のため撤去）
 - `--mp_delegate cpu`（GPU も warm なら同等 〜 §2.0）
 - レンダリング ON（`--no_render` で切れる）
+- `--bbox_mode online`（One-Euro LPF + stable-landmark subset。mesh breathing
+  を抑える。旧挙動に戻すなら `--bbox_mode legacy`。§1.3 / §1.4）
 
 状況別のオプション上乗せ:
 
@@ -703,6 +763,10 @@ bash demos/run_demo_webcam.sh
 | カメラ／表示パイプの I/O 上限だけ測りたい | `--capture_only` |
 | FPS が明らかに低く `cap.set` を疑いたい | `--minimal_cap`（全 `cap.set()` スキップ＝DECA 相当） |
 | 眼球向きも保存したい（FlashAvatar 用） | `--with_eye_pose [--save_path path.jsonl]` |
+| メッシュが顔に合っているか目視確認したい | `--overlay [--overlay_alpha 0.55]`（§1.4） |
+| 耳・頭頂を含む 5023 頂点を点群で確認したい | `--show_vertices`（既定 `--vertex_radius 0` で 1 px 直接代入、§1.2 / §1.4） |
+| クロップ揺れによる mesh breathing を抑えたい | （既定で `--bbox_mode online`）。旧挙動に戻すなら `--bbox_mode legacy`（§1.4） |
+| 同一人物を長時間録画し identity を安定させたい | `--freeze_shape [--freeze_shape_warmup_frames 45]`（§1.3.1 / §1.4） |
 
 デバッグに迷ったら **まず `--minimal_cap` で DECA 相当の素の挙動** を取って
 基準値を確定してから、必要な機能を 1 つずつ足していく流れが最短です。

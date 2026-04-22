@@ -17,44 +17,15 @@ from src.renderer.renderer import Renderer
 import argparse
 import src.utils.masking as masking_utils
 from utils.mediapipe_utils import run_mediapipe
+from utils.vertex_viz import (
+    add_vertex_viz_args,
+    alpha_blend_mesh_over_input,
+    crop_pixels_to_full_pixels,
+    draw_vertex_points_tensor,
+    ndc_to_crop_pixels,
+)
 from datasets.base_dataset import create_mask
 import torch.nn.functional as F
-
-
-def _alpha_blend_mesh_over_input(input_img_chw, rendered_img_chw, alpha):
-    """Alpha-blend ``rendered_img_chw`` over ``input_img_chw`` where the mesh is
-    non-black. Both tensors are (1, 3, H, W) in [0, 1]."""
-    mesh_mask = (rendered_img_chw.sum(dim=1, keepdim=True) > 1e-3).float()
-    effective_alpha = mesh_mask * float(alpha)
-    return input_img_chw * (1.0 - effective_alpha) + rendered_img_chw * effective_alpha
-
-
-def _ndc_to_crop_pixels(transformed_vertices_ndc, image_size):
-    verts = transformed_vertices_ndc.squeeze(0).detach().cpu().numpy()[:, :2]
-    return (verts + 1.0) * 0.5 * image_size
-
-
-def _crop_pixels_to_full_pixels(crop_pixels, tform):
-    homog = np.hstack([crop_pixels, np.ones((crop_pixels.shape[0], 1))])
-    return np.dot(tform.inverse.params, homog.T).T[:, :2]
-
-
-def _draw_vertex_points(img_chw_tensor, pixels_xy,
-                        color_rgb=(0, 255, 255), radius=1, stride=1):
-    """Draw all FLAME vertices as colored dots. Lets you see head regions the
-    default face-only rasterizer omits (ears, scalp, neck)."""
-    _, _, h, w = img_chw_tensor.shape
-    img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8).copy()
-    pts = pixels_xy[::stride] if stride > 1 else pixels_xy
-    colour = tuple(int(v) for v in color_rgb)
-    r = int(max(1, radius))
-    for x, y in pts:
-        xi, yi = int(x), int(y)
-        if 0 <= xi < w and 0 <= yi < h:
-            cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
-    return (
-        torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    ).to(img_chw_tensor.device)
 
 
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
@@ -88,21 +59,7 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
-    parser.add_argument('--overlay', action='store_true',
-                        help='Draw the rendered mesh alpha-blended on top of the input '
-                             'frame instead of side-by-side. Lets you judge fit quality '
-                             'directly.')
-    parser.add_argument('--overlay_alpha', type=float, default=0.55,
-                        help='Alpha for the mesh in --overlay mode (0=input only, '
-                             '1=mesh only). Default 0.55.')
-    parser.add_argument('--show_vertices', action='store_true',
-                        help='Draw all FLAME vertices as colored dots on the right panel. '
-                             'Useful for inspecting head regions the default face-only '
-                             'rasterizer omits (ears, scalp, neck).')
-    parser.add_argument('--vertex_radius', type=int, default=1,
-                        help='Radius (px) for each vertex dot. Default 1.')
-    parser.add_argument('--vertex_stride', type=int, default=1,
-                        help='Stride when sampling the ~5023 FLAME vertices. Default 1.')
+    add_vertex_viz_args(parser)
 
     args = parser.parse_args()
 
@@ -183,34 +140,38 @@ if __name__ == '__main__':
 
         full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2,0,1).unsqueeze(0).float()/255.0
         right_panel = (
-            _alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
+            alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
             if args.overlay else rendered_img_orig
         )
         if args.show_vertices:
-            crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
+            crop_pixels = ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
             if args.crop:
-                pixels_full = _crop_pixels_to_full_pixels(crop_pixels, tform)
+                pixels_full = crop_pixels_to_full_pixels(crop_pixels, tform)
             else:
                 scale_x = orig_image_width / float(image_size)
                 scale_y = orig_image_height / float(image_size)
                 pixels_full = crop_pixels * np.array([scale_x, scale_y])
-            right_panel = _draw_vertex_points(
+            right_panel = draw_vertex_points_tensor(
                 right_panel, pixels_full,
-                radius=args.vertex_radius, stride=args.vertex_stride,
+                radius=args.vertex_radius,
+                radius_rel=args.vertex_radius_rel,
+                stride=args.vertex_stride,
             )
         grid = torch.cat([full_image, right_panel], dim=3)
     else:
         if args.overlay:
-            right_panel = _alpha_blend_mesh_over_input(
+            right_panel = alpha_blend_mesh_over_input(
                 cropped_image, rendered_img, args.overlay_alpha
             )
         else:
             right_panel = rendered_img
         if args.show_vertices:
-            crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
-            right_panel = _draw_vertex_points(
+            crop_pixels = ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
+            right_panel = draw_vertex_points_tensor(
                 right_panel, crop_pixels,
-                radius=args.vertex_radius, stride=args.vertex_stride,
+                radius=args.vertex_radius,
+                radius_rel=args.vertex_radius_rel,
+                stride=args.vertex_stride,
             )
         grid = torch.cat([cropped_image, right_panel], dim=3)
 

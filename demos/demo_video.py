@@ -21,87 +21,15 @@ from utils.bbox_tracker import (
     extract_bbox_center_size,
     fir_lowpass_offline,
 )
+from utils.vertex_viz import (
+    add_vertex_viz_args,
+    alpha_blend_mesh_over_input,
+    crop_pixels_to_full_pixels,
+    draw_vertex_points_tensor,
+    ndc_to_crop_pixels,
+)
 from datasets.base_dataset import create_mask
 import torch.nn.functional as F
-
-
-def _alpha_blend_mesh_over_input(input_img_chw, rendered_img_chw, alpha):
-    """Alpha-blend ``rendered_img_chw`` on top of ``input_img_chw`` wherever the
-    mesh is non-black, leaving the rest of the input untouched.
-
-    Both tensors are (1, 3, H, W) in [0, 1]. Returns a tensor of the same
-    shape. Uses the fact that the renderer writes pure black (0, 0, 0) outside
-    the rasterized mesh, so the mesh mask is ``rendered.sum(dim=1) > 0``.
-    """
-    mesh_mask = (rendered_img_chw.sum(dim=1, keepdim=True) > 1e-3).float()
-    effective_alpha = mesh_mask * float(alpha)
-    return input_img_chw * (1.0 - effective_alpha) + rendered_img_chw * effective_alpha
-
-
-def _ndc_to_crop_pixels(transformed_vertices_ndc, image_size):
-    """(1, N, 2+) NDC → (N, 2) pixel coords in the ``image_size`` crop."""
-    verts = transformed_vertices_ndc.squeeze(0).detach().cpu().numpy()[:, :2]
-    return (verts + 1.0) * 0.5 * image_size
-
-
-def _crop_pixels_to_full_pixels(crop_pixels, tform):
-    """Lift crop-space pixel coords to original-image pixel coords via
-    ``tform.inverse`` (the same similarity transform used by ``crop_face``)."""
-    homog = np.hstack([crop_pixels, np.ones((crop_pixels.shape[0], 1))])
-    return np.dot(tform.inverse.params, homog.T).T[:, :2]
-
-
-def _draw_vertex_points(img_chw_tensor, pixels_xy,
-                        color_rgb=(0, 255, 255), radius=1, radius_rel=None, stride=1):
-    """Draw points at ``pixels_xy`` on ``img_chw_tensor``.
-
-    Useful for inspecting head regions that the default face-only rasterizer
-    culls (ears, scalp, neck) since it gives you the full 5023-vertex shape
-    at the same projected 2D position as the mesh.
-
-    ``color_rgb`` is interpreted in the same channel order as the input image
-    (demos use RGB intermediate, then swap to BGR for the video writer), so
-    (0, 255, 255) renders as cyan in the final mp4.
-
-    ``radius`` is the absolute radius in pixels. ``radius=0`` writes a single
-    pixel directly (no ``cv2.circle`` / no LINE_AA), which is the crispest
-    possible dot — useful on low-resolution videos where even radius=1 looks
-    large because LINE_AA bleeds across a 3x3 neighbourhood.
-
-    ``radius_rel``, if given, overrides ``radius`` and is interpreted as a
-    fraction of ``min(frame_h, frame_w)``. This lets the caller specify "dots
-    roughly 0.1% of the frame" once and get sensible sizes across 480p, 1080p,
-    and 4K inputs. Values that round down to 0 produce single-pixel dots.
-    """
-    _, _, h, w = img_chw_tensor.shape
-    if radius_rel is not None:
-        r = int(round(float(radius_rel) * min(h, w)))
-    else:
-        r = int(radius)
-    r = max(0, r)
-
-    img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8).copy()
-
-    pts = pixels_xy
-    if stride > 1:
-        pts = pts[::stride]
-
-    if r == 0:
-        colour_arr = np.array([int(v) for v in color_rgb], dtype=np.uint8)
-        for x, y in pts:
-            xi, yi = int(x), int(y)
-            if 0 <= xi < w and 0 <= yi < h:
-                img_np[yi, xi] = colour_arr
-    else:
-        colour = tuple(int(v) for v in color_rgb)
-        for x, y in pts:
-            xi, yi = int(x), int(y)
-            if 0 <= xi < w and 0 <= yi < h:
-                cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
-
-    return (
-        torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    ).to(img_chw_tensor.device)
 
 
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
@@ -135,35 +63,7 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
-    parser.add_argument('--overlay', action='store_true',
-                        help='Draw the rendered mesh alpha-blended on top of the input '
-                             'frame instead of side-by-side. Lets you judge fit quality '
-                             'directly.')
-    parser.add_argument('--overlay_alpha', type=float, default=0.55,
-                        help='Alpha for the mesh in --overlay mode (0=input only, '
-                             '1=mesh only). Default 0.55.')
-    parser.add_argument('--show_vertices', action='store_true',
-                        help='Draw all FLAME vertices as colored dots on the right panel. '
-                             'Lets you see head regions the default face-only rasterizer '
-                             'omits (ears, scalp, neck). Combine with --overlay to inspect '
-                             'the full predicted shape against the real face.')
-    parser.add_argument('--vertex_radius', type=int, default=1,
-                        help='Absolute radius (px) for each vertex dot. Pass 0 '
-                             'to draw a true single-pixel dot (no anti-aliasing), '
-                             'which is the crispest option on low-resolution '
-                             'videos where LINE_AA circles look fuzzy. Ignored '
-                             'when --vertex_radius_rel is set. Default 1.')
-    parser.add_argument('--vertex_radius_rel', type=float, default=None,
-                        help='Radius expressed as a fraction of '
-                             'min(frame_height, frame_width) on the panel that '
-                             'the dots are drawn on. E.g. 0.001 on a 1080p frame '
-                             '→ ~1 px; 0.0005 → single-pixel dot. Overrides '
-                             '--vertex_radius when set. Recommended over the '
-                             'absolute flag when comparing across videos of '
-                             'different resolutions.')
-    parser.add_argument('--vertex_stride', type=int, default=1,
-                        help='Stride when sampling the ~5023 FLAME vertices '
-                             '(1 = every vertex; 2 = every other; etc.). Default 1.')
+    add_vertex_viz_args(parser)
 
     parser.add_argument('--bbox_mode', type=str, default='online',
                         choices=['legacy', 'online', 'offline'],
@@ -463,18 +363,18 @@ if __name__ == '__main__':
 
             full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2,0,1).unsqueeze(0).float()/255.0
             right_panel = (
-                _alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
+                alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
                 if args.overlay else rendered_img_orig
             )
             if args.show_vertices:
-                crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
+                crop_pixels = ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
                 if args.crop:
-                    pixels_full = _crop_pixels_to_full_pixels(crop_pixels, tform)
+                    pixels_full = crop_pixels_to_full_pixels(crop_pixels, tform)
                 else:
                     scale_x = video_width / float(input_image_size)
                     scale_y = video_height / float(input_image_size)
                     pixels_full = crop_pixels * np.array([scale_x, scale_y])
-                right_panel = _draw_vertex_points(
+                right_panel = draw_vertex_points_tensor(
                     right_panel, pixels_full,
                     radius=args.vertex_radius,
                     radius_rel=args.vertex_radius_rel,
@@ -483,14 +383,14 @@ if __name__ == '__main__':
             grid = torch.cat([full_image, right_panel], dim=3)
         else:
             if args.overlay:
-                right_panel = _alpha_blend_mesh_over_input(
+                right_panel = alpha_blend_mesh_over_input(
                     cropped_image, rendered_img, args.overlay_alpha
                 )
             else:
                 right_panel = rendered_img
             if args.show_vertices:
-                crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
-                right_panel = _draw_vertex_points(
+                crop_pixels = ndc_to_crop_pixels(renderer_output['transformed_vertices'], input_image_size)
+                right_panel = draw_vertex_points_tensor(
                     right_panel, crop_pixels,
                     radius=args.vertex_radius,
                     radius_rel=args.vertex_radius_rel,
