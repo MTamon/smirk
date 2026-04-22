@@ -64,13 +64,27 @@ STABLE_LANDMARK_INDICES = np.array(
 # Measured on repository sample images:
 #   test_image1.png:  size_stable / size_legacy = 0.611
 #   test_image2.png:  size_stable / size_legacy = 0.645
-# so ~1.6 recovers parity with legacy. We default to 1.85 to give the crop
-# ~15-20% more extent than legacy — enough to clearly include ears and some of
-# the neck, which the user asked for ("少し余裕があるくらいが良い"). Legacy's
-# scale=1.4 was already a tight fit on ears; matching it 1:1 would still clip.
-# Adjust via ``size_calibration=`` (function arg) or ``--bbox_size_calibration``
-# (CLI) if your footage crops too tight / too loose.
-STABLE_LANDMARK_SIZE_CALIBRATION = 1.85
+# so ~1.6 recovers parity with legacy.
+#
+# Calibration upper bound comes from SMIRK's training-time scale augmentation:
+#   configs/config_train.yaml: train_scale_min=1.2, train_scale_max=1.8,
+#                              test_scale=1.6
+# "Scale" there is the padding multiplier on the legacy ``(W+H)/2`` size. Our
+# effective scale on that measure is
+#   effective_legacy_scale = calib × (size_stable / size_legacy) × bbox_scale
+# With ratio ≈ 0.628 and ``--bbox_scale 1.4``:
+#   calib 1.85 → effective 1.63 (matches test_scale=1.6)
+#   calib 2.00 → effective 1.76 (near training max, safe)
+#   calib 2.20 → effective 1.93 (OUT of training dist; mesh may under-predict)
+# The default 2.0 is the *widest* crop that still stays inside SMIRK's training
+# distribution — at that size the face fills ~66% of 224×224 vertically, leaving
+# ~17% margin top and bottom, so ears fit clearly, the full forehead/chin is
+# visible, and there is some neck below the chin. Adjust via ``size_calibration=``
+# (arg) or ``--bbox_size_calibration`` (CLI): ~1.6 for legacy parity, 2.2-2.3
+# for even wider crops at the cost of some mesh-prediction accuracy (FLAME ortho
+# camera was not trained on that framing so ``cam_scale`` can under-shoot — the
+# rendered mesh ends up visibly smaller than the face in the frame).
+STABLE_LANDMARK_SIZE_CALIBRATION = 2.0
 
 
 def extract_bbox_center_size(

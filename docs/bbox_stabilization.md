@@ -130,16 +130,31 @@ MediaPipe FaceMesh の478点のうち、以下15点のみを **`size`** の算�
 
 安定部分集合は**鉛直方向の extent が大幅に縮む**（鼻梁〜鼻先までで額も顎も含まない → フル顔の 1/3 程度）。`size = (width + height)/2` をそのまま使うと、stable-subset size はレガシー size の約 60〜65% にしかならない。`samples/test_image1.png` で `size_stable / size_legacy = 0.611`、`samples/test_image2.png` で `0.645`。そのままでは `--bbox_scale 1.4` を掛けても顔の一部しか crop できない。
 
-対策として `STABLE_LANDMARK_SIZE_CALIBRATION = 1.85`（定数）を stable-subset 時だけ `size` に掛ける：
+対策として `STABLE_LANDMARK_SIZE_CALIBRATION = 2.0`（定数）を stable-subset 時だけ `size` に掛ける：
 
 ```python
-size = ((width_stable) + (height_stable)) / 2 * cal   # cal = 1.85
+size = ((width_stable) + (height_stable)) / 2 * cal   # cal = 2.0
 ```
 
-- **1.85 の狙い：** レガシー parity ぴったり（≒ 1.6）ではなく **レガシー pad の +15〜20%** を既定値に。レガシー自身 `scale=1.4` では耳がギリギリ入るかどうかで、首はほぼ映らない。`+15〜20%` 余分に取れば耳が余裕で入り、顎の下に 20〜25 px の首マージンが確保できる（test_image1 で 47 px、test_image2 で 54 px）。
-- `--bbox_scale` の意味は変えない（legacy 1.4 のまま）。scale を上げすぎない方針を保ったまま、stable mode 固有の縮み分だけ補正する。
-- `--bbox_size_calibration` で override 可能。きつすぎ／緩すぎを感じたら微調整（1.6 ≒ legacy parity、2.0〜2.2 でさらに広く）。
-- `1.0` を明示的に渡すと補正オフ（旧 0.65x バグ再現）。
+**上限は SMIRK の学習時 scale 分布から決めている。** `configs/config_train.yaml` は `train_scale_min=1.2, train_scale_max=1.8, test_scale=1.6`（= レガシー `size_legacy` に対する padding 倍率）。stable モードでの「レガシー相当 scale」は
+
+```
+effective_legacy_scale = calib × (size_stable / size_legacy) × bbox_scale
+                       ≈ calib × 0.628 × 1.4        (bbox_scale=1.4 既定)
+```
+
+| calib | effective legacy scale | SMIRK 学習分布 |
+|---|---|---|
+| 1.55 | 1.36 | ○（学習分布内） |
+| 1.85 | 1.63 | ○（test_scale=1.6 に一致） |
+| **2.00** | **1.76** | **○（学習上限 1.8 の直下、既定値）** |
+| 2.20 | 1.93 | **×（分布外、mesh が縮む可能性）** |
+| 2.30 | 2.02 | × |
+
+**2.0 を既定に選ぶ理由：** SMIRK の学習分布を超えずに取れる最大の crop。この設定で face（landmark 10〜152）は 224×224 縦の約 66% を占め、上下に各 17% 前後の余白ができる。耳は余裕で入り、額・顎の先まで映り、顎下にも首が少し見える。より広い crop（2.2〜2.3）は可能だが、SMIRK が未学習の frame に対して `cam_scale` を過小予測し、**レンダリングされた mesh が実際の顔より小さく見える**副作用が出る（ユーザ観測と一致）。
+
+- `--bbox_scale` は 1.4 のまま（scale を上げすぎない方針を維持）。stable mode 固有の縮み分のみ calib で補正する。
+- `--bbox_size_calibration` で override 可能：1.6 で legacy parity、2.2〜2.3 で広く（mesh 精度は犠牲）、1.0 で補正オフ（旧 0.65× バグ再現）。
 
 ### 3.1.2 One-Euro filter（オンライン用）
 
@@ -225,7 +240,7 @@ median を使うのは外れ値（極端な表情・大回転・検出失敗）�
 |---|---|---|
 | `--bbox_mode` | `online` | バグ修正が主目的なので有効化がデフォルト |
 | `--bbox_all_landmarks` | off（安定subset使用） | 同上 |
-| `--bbox_size_calibration` | None（= 1.85） | 安定 subset の縮小を補正し、レガシーより +15〜20% 広い crop で耳・首を含める |
+| `--bbox_size_calibration` | None（= 2.0） | 安定 subset の縮小を補正。effective legacy scale ≒ 1.76 で SMIRK 学習分布の上端（1.8）直下に収まる最大の crop |
 | `--freeze_shape` | off | 人物依存な挙動変更なのでオプトイン |
 | `--online_center_cutoff` | None（平滑化なし） | 並進の遅延を出さないため |
 | `--offline_center_cutoff` | None | 同上 |

@@ -188,11 +188,14 @@ if __name__ == '__main__':
                              'for its smaller vertical extent (nose-only instead of '
                              'forehead-to-chin). Default is the value in '
                              'utils.bbox_tracker.STABLE_LANDMARK_SIZE_CALIBRATION '
-                             '(1.85), which yields ~15-20%% more crop extent than '
-                             '--bbox_mode legacy so ears are clearly included and the '
-                             'neck stays in frame. Use ~1.6 for legacy parity, or 2.0-2.2 '
-                             'for even wider coverage. Pass 1.0 to disable. Ignored when '
-                             '--bbox_all_landmarks or --bbox_mode legacy is set.')
+                             '(2.0) — the widest crop that still stays inside SMIRK\'s '
+                             'training scale distribution (train_scale_max=1.8; effective '
+                             'legacy scale at calib=2.0 is ~1.76). Larger values (2.2-2.3) '
+                             'give an even wider crop but push SMIRK out of its training '
+                             'distribution and the predicted FLAME mesh can visibly '
+                             'under-shoot the real face. Use ~1.6 for legacy parity, '
+                             '1.0 to disable. Ignored when --bbox_all_landmarks or '
+                             '--bbox_mode legacy is set.')
     parser.add_argument('--online_size_min_cutoff', type=float, default=1.0,
                         help='One-Euro min_cutoff (Hz) for the bbox-size filter in '
                              '--bbox_mode online. Default 1.0.')
