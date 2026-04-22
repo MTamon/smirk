@@ -29,6 +29,34 @@ def _alpha_blend_mesh_over_input(input_img_chw, rendered_img_chw, alpha):
     return input_img_chw * (1.0 - effective_alpha) + rendered_img_chw * effective_alpha
 
 
+def _ndc_to_crop_pixels(transformed_vertices_ndc, image_size):
+    verts = transformed_vertices_ndc.squeeze(0).detach().cpu().numpy()[:, :2]
+    return (verts + 1.0) * 0.5 * image_size
+
+
+def _crop_pixels_to_full_pixels(crop_pixels, tform):
+    homog = np.hstack([crop_pixels, np.ones((crop_pixels.shape[0], 1))])
+    return np.dot(tform.inverse.params, homog.T).T[:, :2]
+
+
+def _draw_vertex_points(img_chw_tensor, pixels_xy,
+                        color_rgb=(0, 255, 255), radius=1, stride=1):
+    """Draw all FLAME vertices as colored dots. Lets you see head regions the
+    default face-only rasterizer omits (ears, scalp, neck)."""
+    _, _, h, w = img_chw_tensor.shape
+    img_np = (img_chw_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8).copy()
+    pts = pixels_xy[::stride] if stride > 1 else pixels_xy
+    colour = tuple(int(v) for v in color_rgb)
+    r = int(max(1, radius))
+    for x, y in pts:
+        xi, yi = int(x), int(y)
+        if 0 <= xi < w and 0 <= yi < h:
+            cv2.circle(img_np, (xi, yi), r, colour, -1, lineType=cv2.LINE_AA)
+    return (
+        torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    ).to(img_chw_tensor.device)
+
+
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
     left = np.min(landmarks[:, 0])
     right = np.max(landmarks[:, 0])
@@ -67,6 +95,14 @@ if __name__ == '__main__':
     parser.add_argument('--overlay_alpha', type=float, default=0.55,
                         help='Alpha for the mesh in --overlay mode (0=input only, '
                              '1=mesh only). Default 0.55.')
+    parser.add_argument('--show_vertices', action='store_true',
+                        help='Draw all FLAME vertices as colored dots on the right panel. '
+                             'Useful for inspecting head regions the default face-only '
+                             'rasterizer omits (ears, scalp, neck).')
+    parser.add_argument('--vertex_radius', type=int, default=1,
+                        help='Radius (px) for each vertex dot. Default 1.')
+    parser.add_argument('--vertex_stride', type=int, default=1,
+                        help='Stride when sampling the ~5023 FLAME vertices. Default 1.')
 
     args = parser.parse_args()
 
@@ -150,6 +186,18 @@ if __name__ == '__main__':
             _alpha_blend_mesh_over_input(full_image, rendered_img_orig, args.overlay_alpha)
             if args.overlay else rendered_img_orig
         )
+        if args.show_vertices:
+            crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
+            if args.crop:
+                pixels_full = _crop_pixels_to_full_pixels(crop_pixels, tform)
+            else:
+                scale_x = orig_image_width / float(image_size)
+                scale_y = orig_image_height / float(image_size)
+                pixels_full = crop_pixels * np.array([scale_x, scale_y])
+            right_panel = _draw_vertex_points(
+                right_panel, pixels_full,
+                radius=args.vertex_radius, stride=args.vertex_stride,
+            )
         grid = torch.cat([full_image, right_panel], dim=3)
     else:
         if args.overlay:
@@ -158,6 +206,12 @@ if __name__ == '__main__':
             )
         else:
             right_panel = rendered_img
+        if args.show_vertices:
+            crop_pixels = _ndc_to_crop_pixels(renderer_output['transformed_vertices'], image_size)
+            right_panel = _draw_vertex_points(
+                right_panel, crop_pixels,
+                radius=args.vertex_radius, stride=args.vertex_stride,
+            )
         grid = torch.cat([cropped_image, right_panel], dim=3)
 
 

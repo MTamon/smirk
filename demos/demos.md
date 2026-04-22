@@ -58,6 +58,7 @@ FLAME のユーザ名・パスワードを対話で聞かれます（flame.is.tu
 | `demo.py` | 単一画像→メッシュ重ね描き | `bash demos/run_demo.sh --input_path samples/test_image1.png --crop` |
 | `demo_video.py` | 動画ファイル→並置描画 mp4 | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop` |
 | 〃 `--overlay` | 右パネルを alpha blend 重畳にする（§1.1） | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay` |
+| 〃 `--show_vertices` | 耳・後頭部を含む FLAME 頂点を点群描画（§1.2） | `bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices` |
 | `demo_save_flame.py` | 動画→FLAME パラメータ .pt 保存（描画なし） | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --crop --benchmark` |
 | 〃 `--with_eye_pose` | + MediaPipe blendshape 由来の eyes_pose / eyelids 追加 | `bash demos/run_demo_save_flame.sh --input_path samples/dafoe.mp4 --with_eye_pose --benchmark --mp_delegate gpu` |
 | `demo_webcam.py` | Web カメラ→リアルタイム推論＋メッシュ重畳 | `bash demos/run_demo_webcam.sh` |
@@ -93,6 +94,40 @@ bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --o
 **保存される FLAME パラメータには影響しません**。`--use_smirk_generator`
 と組み合わせてもジェネレータ入力（6ch 画像）には影響しません —
 生成ネットは引き続き無改変の `rendered_img` を受け取ります。
+
+### 1.2 `--show_vertices`: 耳・後頭部を含む FLAME 頂点を点群として可視化する
+
+SMIRK の `Renderer` は既定で `render_full_head=False` で初期化されており、
+FLAME の `face` マスクに含まれる三角形だけを rasterize します。これは
+論文どおりの挙動ですが、**耳・頭頂・首**の頂点は描画されず、右パネルの
+メッシュだけでは SMIRK が出力した耳の形状などを目視確認できません。
+
+`--show_vertices` を付けると、`renderer_output['transformed_vertices']`
+（FLAME 5023 頂点を `batch_orth_proj` で投影した NDC 座標）を crop または
+原画のピクセル空間に戻して、各頂点を `cv2.circle` でシアンの点として
+描画します。
+
+```bash
+# メッシュ + 点群
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --show_vertices
+
+# 実映像に重畳しつつ点群も併せる（耳の形状が最も確認しやすい）
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices
+
+# 点を大きくして見やすく
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_radius 2
+
+# 点数を間引いて密度を下げる（5023 頂点 → stride=4 で約 1256 点）
+bash demos/run_demo_video.sh --input_path samples/dafoe.mp4 --crop --overlay --show_vertices --vertex_stride 4
+```
+
+**補足:**
+
+- 頂点は背面も含む 5023 点全てを描画します（深度フィルタリングなし）。
+  裏側頂点もシアンで塗られるので「耳は少し濃く見える」のような効果あり
+- `--render_orig` 併用時は crop→原画の similarity transform `tform.inverse`
+  を使って原画ピクセル空間に lift してから描画します
+- 保存される `.pt`・FLAME パラメータには影響しません（描画専用）
 
 ### ステップ A.5. シェルラッパ経由で実行する理由（重要）
 
