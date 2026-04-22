@@ -176,14 +176,21 @@ bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode legacy
   のほうが視覚的に目立つので、`size` だけ平滑化する設計
 - **安定ランドマーク部分集合**だけで `size` を算出するので、6-7Hz の口の動き
   は元から `size` 信号に載らない → LPF カットオフを 2.5Hz まで下げても問題ない
+- **`center` は全ランドマークから算出**（size だけ stable subset）。安定 subset
+  は鉛直方向に鼻梁〜鼻先しかカバーしないため、その `(top+bottom)/2` をそのまま
+  crop 中心にすると **顔中心より上寄りになり顎・首が切れる**（サンプル画像で
+  +8〜+18 px のバイアス）。center 側は全ランドマークに戻して、crop が顔に
+  揃うようにしている。center が口開閉で多少動いても純粋な平行移動で、
+  ortho カメラのスケールには影響しない＝ ears/scalp の breathing は出ない
 - **One-Euro filter の beta** で適応度を調整。`beta=0.02`（既定）は静止時に
   強平滑、急な距離変化でも低遅延で追従する
 - **`--bbox_size_calibration`**：安定 subset は鼻梁〜鼻先までしか鉛直 extent を
-  持たない（口・顎・額を除外しているため）ので、legacy と同じ `bbox_scale=1.4`
-  では顔の一部しか crop できない。`STABLE_LANDMARK_SIZE_CALIBRATION=1.55` を
-  `size` に掛けて legacy と同等の絶対 crop サイズに揃えている。きつすぎ／
-  緩すぎを感じたら `--bbox_size_calibration 1.4`（狭める）/ `1.7`（広げる）
-  のように調整してください。`1.0` でオフ（旧バグの再現）
+  持たないので、stable size はレガシー size の約 60〜65% にしかならず、legacy
+  と同じ `bbox_scale=1.4` では顔の一部しか crop できない。
+  `STABLE_LANDMARK_SIZE_CALIBRATION=1.85` を `size` に掛けて、レガシー pad の
+  **+15〜20%** 広い crop にしている（耳を余裕で含み、顎下に約 50 px の首
+  マージンを確保）。レガシー parity にしたければ `--bbox_size_calibration 1.6`、
+  さらに広く取りたければ `2.0〜2.2`。`1.0` でオフ（旧バグの再現）
 
 詳細な設計思想と周波数選択の根拠は `docs/bbox_stabilization.md` を参照。
 
@@ -228,7 +235,7 @@ bash demos/run_demo_video.sh --input_path <mp4> --crop --bbox_mode offline --fre
 | `--bbox_mode` | `online` | `legacy` / `online` / `offline` |
 | `--bbox_scale` | `1.4` | bbox パディング係数。旧値と同じ |
 | `--bbox_all_landmarks` | false | 指定時は旧挙動（478 点全て使用） |
-| `--bbox_size_calibration` | None（= 1.55） | 安定 subset の size を補正しレガシー crop と同等サイズに揃える |
+| `--bbox_size_calibration` | None（= 1.85） | 安定 subset の size を補正。レガシー crop より +15〜20% 広く、耳・首を含む |
 | `--online_size_min_cutoff` | `1.0` | One-Euro 最小カットオフ（Hz） |
 | `--online_size_beta` | `0.02` | One-Euro 速度感度 |
 | `--online_center_cutoff` | None | 指定時のみ center も One-Euro 平滑化 |

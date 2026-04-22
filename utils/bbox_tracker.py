@@ -58,16 +58,19 @@ STABLE_LANDMARK_INDICES = np.array(
 # extent is comparable to the full-face width since 234 / 454 are temple
 # points at the widest part of the face. Using the legacy
 # ``(width + height) / 2`` size formula on the stable subset therefore yields
-# a ``size`` about 60% of what the all-landmarks formula produced, and a
+# a ``size`` about 60-65% of what the all-landmarks formula produced, and a
 # legacy ``--bbox_scale 1.4`` no longer covers the whole face.
 #
-# The calibration below rescales the stable-subset size so that the effective
-# crop matches what the legacy pipeline was trained on, keeping ``bbox_scale``
-# semantics unchanged across modes. Tuned empirically to make the average crop
-# visually match ``--bbox_mode legacy --bbox_scale 1.4``; adjust via
-# ``size_calibration=`` (function arg) or the ``--bbox_size_calibration`` CLI
-# flag if your footage crops too tight / too loose.
-STABLE_LANDMARK_SIZE_CALIBRATION = 1.55
+# Measured on repository sample images:
+#   test_image1.png:  size_stable / size_legacy = 0.611
+#   test_image2.png:  size_stable / size_legacy = 0.645
+# so ~1.6 recovers parity with legacy. We default to 1.85 to give the crop
+# ~15-20% more extent than legacy — enough to clearly include ears and some of
+# the neck, which the user asked for ("少し余裕があるくらいが良い"). Legacy's
+# scale=1.4 was already a tight fit on ears; matching it 1:1 would still clip.
+# Adjust via ``size_calibration=`` (function arg) or ``--bbox_size_calibration``
+# (CLI) if your footage crops too tight / too loose.
+STABLE_LANDMARK_SIZE_CALIBRATION = 1.85
 
 
 def extract_bbox_center_size(
@@ -81,36 +84,55 @@ def extract_bbox_center_size(
     ``old_size = (right - left + bottom - top) / 2`` convention). ``center``
     is the bbox midpoint.
 
-    When ``use_stable_subset`` is True, only the speech/blink-invariant
-    landmarks are used; the resulting size no longer grows when the subject
-    opens their mouth. A calibration factor (``size_calibration``) is applied
-    to compensate for the smaller vertical extent of the subset — without it,
-    the resulting crop would cover only the eye-to-nose region. Pass
-    ``size_calibration=None`` (the default) to use
-    ``STABLE_LANDMARK_SIZE_CALIBRATION``, or pass ``1.0`` to disable the
-    compensation entirely. The calibration is a no-op when
-    ``use_stable_subset=False``.
+    When ``use_stable_subset`` is True:
+
+    * ``size`` is derived from the speech/blink-invariant landmark subset
+      (eye corners, nose bridge, temples) and multiplied by
+      ``size_calibration`` — this prevents the scale wobble at ears/scalp
+      that the original all-landmarks formula produced when the mouth opens
+      or eyes blink. Pass ``size_calibration=None`` (default) to use
+      ``STABLE_LANDMARK_SIZE_CALIBRATION``; pass ``1.0`` to disable it.
+    * ``center`` is still computed from *all* landmarks. The stable subset
+      only spans nose-root to nose-tip vertically (roughly the upper half of
+      the face), so its ``(top + bottom) / 2`` midpoint sits noticeably above
+      the true face center — using it as the crop centre shifted the crop up
+      and left the neck out of frame. The all-landmarks centre keeps the
+      crop face-centred, and ``center`` drift is a pure translation (no
+      scale wobble), so it does not trigger the mesh-breathing artifact the
+      stable subset was introduced to fix.
+
+    When ``use_stable_subset`` is False both center and size fall back to the
+    full-landmark bbox (exactly the legacy ``crop_face`` formula).
     """
+    all_xs = landmarks[:, 0]
+    all_ys = landmarks[:, 1]
+    all_left = float(np.min(all_xs))
+    all_right = float(np.max(all_xs))
+    all_top = float(np.min(all_ys))
+    all_bottom = float(np.max(all_ys))
+    center = np.array(
+        [(all_left + all_right) / 2.0, (all_top + all_bottom) / 2.0],
+        dtype=np.float64,
+    )
+
     if use_stable_subset:
         pts = landmarks[STABLE_LANDMARK_INDICES]
+        sx = pts[:, 0]
+        sy = pts[:, 1]
+        left = float(np.min(sx))
+        right = float(np.max(sx))
+        top = float(np.min(sy))
+        bottom = float(np.max(sy))
         cal = (
             STABLE_LANDMARK_SIZE_CALIBRATION
             if size_calibration is None
             else float(size_calibration)
         )
     else:
-        pts = landmarks
+        left, right, top, bottom = all_left, all_right, all_top, all_bottom
         cal = 1.0
-    xs = pts[:, 0]
-    ys = pts[:, 1]
-    left = float(np.min(xs))
-    right = float(np.max(xs))
-    top = float(np.min(ys))
-    bottom = float(np.max(ys))
+
     size = ((right - left) + (bottom - top)) / 2.0 * cal
-    center = np.array(
-        [(left + right) / 2.0, (top + bottom) / 2.0], dtype=np.float64,
-    )
     return center, float(size)
 
 

@@ -112,7 +112,7 @@ old_size = (right - left + bottom - top) / 2
 
 ### 3.1.1 安定ランドマーク部分集合
 
-MediaPipe FaceMesh の478点のうち、以下15点のみを bbox 算出に使う：
+MediaPipe FaceMesh の478点のうち、以下15点のみを **`size`** の算出に使う：
 
 ```
 目: 33, 133, 362, 263         (両目の内外コーナー; 骨に固定)
@@ -124,21 +124,22 @@ MediaPipe FaceMesh の478点のうち、以下15点のみを bbox 算出に使�
 
 結果：`size = (right-left + bottom-top)/2` は「口を開けると縦に伸びる」挙動をしなくなる。
 
+> **`center` は全ランドマーク版のまま。** 安定 subset は鉛直方向に「鼻梁〜鼻先」しかカバーしないため `(top+bottom)/2` が顔中心より **上寄り**（サンプル画像で +8〜+18 px）になり、crop が上にシフトして顎・首が切れる。`center` を動かしても（mouth-open で顎が下がる等）それは純粋な平行移動であり、SMIRK が予測する ortho カメラのスケールには影響しない＝ ears/scalp の breathing は発生しない。したがって size だけ stable subset にし、center はレガシーどおり全ランドマークの bbox 中点を使う方が安全。
+
 ### 3.1.1.1 `size_calibration`（補正係数）
 
-安定部分集合は**鉛直方向の extent が大幅に縮む**（鼻梁〜鼻先までで額も顎も含まない → フル顔の 1/3 程度）。`size = (width + height)/2` をそのまま使うと、stable-subset size はレガシー size の約 60% にしかならず、`--bbox_scale 1.4` を掛けても **顔の一部しか crop できない** ことが実運用で判明した。
+安定部分集合は**鉛直方向の extent が大幅に縮む**（鼻梁〜鼻先までで額も顎も含まない → フル顔の 1/3 程度）。`size = (width + height)/2` をそのまま使うと、stable-subset size はレガシー size の約 60〜65% にしかならない。`samples/test_image1.png` で `size_stable / size_legacy = 0.611`、`samples/test_image2.png` で `0.645`。そのままでは `--bbox_scale 1.4` を掛けても顔の一部しか crop できない。
 
-対策として `STABLE_LANDMARK_SIZE_CALIBRATION = 1.55`（定数）を stable-subset 時だけ `size` に掛けて、レガシーと同等の絶対サイズに戻している：
+対策として `STABLE_LANDMARK_SIZE_CALIBRATION = 1.85`（定数）を stable-subset 時だけ `size` に掛ける：
 
 ```python
-size = ((width) + (height)) / 2 * cal      # cal = 1.55 when stable subset
+size = ((width_stable) + (height_stable)) / 2 * cal   # cal = 1.85
 ```
 
-- `--bbox_scale` の意味は変えない（legacy 1.4 のまま）
-- `--bbox_size_calibration` で override 可能。きつすぎ／緩すぎを感じたら調整
-- 値の根拠：安定 subset の `height_stable ≈ 0.3 * H_full`、`width_stable ≈ W_full` から `size_stable / size_full ≈ 0.65`、逆数の 1.55 を採用
-
-CLI で明示的に `1.0` を渡すと補正オフ（バグ観察用・旧実装の再現）。
+- **1.85 の狙い：** レガシー parity ぴったり（≒ 1.6）ではなく **レガシー pad の +15〜20%** を既定値に。レガシー自身 `scale=1.4` では耳がギリギリ入るかどうかで、首はほぼ映らない。`+15〜20%` 余分に取れば耳が余裕で入り、顎の下に 20〜25 px の首マージンが確保できる（test_image1 で 47 px、test_image2 で 54 px）。
+- `--bbox_scale` の意味は変えない（legacy 1.4 のまま）。scale を上げすぎない方針を保ったまま、stable mode 固有の縮み分だけ補正する。
+- `--bbox_size_calibration` で override 可能。きつすぎ／緩すぎを感じたら微調整（1.6 ≒ legacy parity、2.0〜2.2 でさらに広く）。
+- `1.0` を明示的に渡すと補正オフ（旧 0.65x バグ再現）。
 
 ### 3.1.2 One-Euro filter（オンライン用）
 
@@ -224,7 +225,7 @@ median を使うのは外れ値（極端な表情・大回転・検出失敗）�
 |---|---|---|
 | `--bbox_mode` | `online` | バグ修正が主目的なので有効化がデフォルト |
 | `--bbox_all_landmarks` | off（安定subset使用） | 同上 |
-| `--bbox_size_calibration` | None（= 1.55） | 安定 subset の縮小を補正しレガシーと同じ crop サイズに揃える |
+| `--bbox_size_calibration` | None（= 1.85） | 安定 subset の縮小を補正し、レガシーより +15〜20% 広い crop で耳・首を含める |
 | `--freeze_shape` | off | 人物依存な挙動変更なのでオプトイン |
 | `--online_center_cutoff` | None（平滑化なし） | 並進の遅延を出さないため |
 | `--offline_center_cutoff` | None | 同上 |
