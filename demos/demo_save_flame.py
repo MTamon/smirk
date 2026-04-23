@@ -24,6 +24,17 @@ Output schema (``.pt``)::
         "eyes_pose":  Tensor (T, 12),    # MediaPipe-blendshape rot6d eyeballs
         "eyelids":    Tensor (T, 2),     # MediaPipe blendshape eyeBlink{L,R}
 
+        # present only when --with_oral_features is set:
+        "mediapipe_landmarks_2d":         Tensor (T, 478, 2),   # crop-space pixel coords
+        "mediapipe_landmarks_inner_mouth_2d": Tensor (T, 20, 2),# inner-lip subset of the above
+        "mediapipe_inner_mouth_indices":  LongTensor (20,),     # MediaPipe 478 indices (metadata)
+        "mouth_blendshapes":              Tensor (T, 27),       # ARKit jaw*/mouth* scores
+        "mouth_blendshape_names":         list[str] (27,),      # names aligned with last axis
+        "mediapipe_transform":            Tensor (T, 4, 4),     # facial transform matrix
+        "flame_landmarks_mp_3d":          Tensor (T, 105, 3),   # SMIRK-driven FLAME MP landmarks
+        "flame_landmarks_inner_mouth_3d": Tensor (T, 20, 3),    # inner-lip subset in FLAME space
+        "flame_mp_inner_mouth_positions": LongTensor (20,),     # positions within the 105-array
+
         # present only when --benchmark is set:
         "bench": {
             "total_seconds":      float,
@@ -67,39 +78,73 @@ from src.smirk_encoder import SmirkEncoder
 from utils.face_crop import fast_crop_face_bgr
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
 from utils.eye_pose import estimate_eye_pose_and_eyelid
+from utils.oral_features import (
+    ARKIT_MOUTH_KEYS,
+    FLAME_MP_INNER_MOUTH,
+    MP_INNER_MOUTH,
+    apply_affine_2x3,
+    extract_inner_mouth_landmarks_2d,
+    extract_inner_mouth_landmarks_3d,
+    extract_mouth_blendshapes,
+)
 
 
 PARAM_DIMS = {'shape': 300, 'exp': 50, 'pose': 6, 'cam': 3, 'eyelid': 2}
 
 
-def detect_and_crop(frame_bgr, need_blendshapes, mp_delegate, image_size=224):
+def detect_and_crop(frame_bgr, need_blendshapes, mp_delegate, image_size=224,
+                    return_extras=False):
     """Return (rgb_224 uint8 or None, blendshapes or None, t_detect, t_warp).
 
-    When need_blendshapes is False this uses the lighter ``run_mediapipe``
-    path and the returned blendshapes dict is None. Detection time and
-    warp time are reported separately so per-stage benchmarks can tell
-    them apart.
+    When ``need_blendshapes`` is False this uses the lighter
+    ``run_mediapipe`` path and the returned blendshapes dict is None.
+    Detection time and warp time are reported separately so per-stage
+    benchmarks can tell them apart.
+
+    When ``return_extras`` is True the return is a 5-tuple instead:
+    ``(rgb_224, blendshapes, t_detect, t_warp, extras)`` where ``extras``
+    is a dict carrying ``'landmarks_full'`` (the raw (478, 2) array in
+    source-image pixel space), the full-res ``'transform'`` (4x4 or None),
+    and the 2x3 crop affine ``'crop_affine'``. On detection failure
+    ``extras`` is None.
     """
     t0 = time.perf_counter()
     if need_blendshapes:
         mp_result = run_mediapipe_full(frame_bgr, delegate=mp_delegate)
         t_detect = time.perf_counter() - t0
         if mp_result is None:
+            if return_extras:
+                return None, None, t_detect, 0.0, None
             return None, None, t_detect, 0.0
         landmarks = mp_result['landmarks'][..., :2]
         blendshapes = mp_result['blendshapes']
+        transform = mp_result.get('transform')
     else:
         landmarks = run_mediapipe(frame_bgr, delegate=mp_delegate)
         t_detect = time.perf_counter() - t0
         if landmarks is None:
+            if return_extras:
+                return None, None, t_detect, 0.0, None
             return None, None, t_detect, 0.0
         landmarks = landmarks[..., :2]
         blendshapes = None
+        transform = None
 
     t1 = time.perf_counter()
-    cropped_bgr = fast_crop_face_bgr(frame_bgr, landmarks, scale=1.4, image_size=image_size)
+    crop_matrix: list = []
+    cropped_bgr = fast_crop_face_bgr(
+        frame_bgr, landmarks, scale=1.4, image_size=image_size,
+        matrix_out=crop_matrix if return_extras else None,
+    )
     cropped = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
     t_warp = time.perf_counter() - t1
+    if return_extras:
+        extras = {
+            'landmarks_full': landmarks,
+            'transform': transform,
+            'crop_affine': crop_matrix[0] if crop_matrix else None,
+        }
+        return cropped, blendshapes, t_detect, t_warp, extras
     return cropped, blendshapes, t_detect, t_warp
 
 
@@ -152,6 +197,16 @@ def main():
                              'eyelids (2D) from MediaPipe Tasks blendshapes '
                              'and save them alongside the SMIRK outputs. '
                              'Implies --crop (mediapipe must run per-frame).')
+    parser.add_argument('--with_oral_features', action='store_true',
+                        help='Also save mouth-interior signals so downstream '
+                             'avatars (FlashAvatar etc.) can drive teeth / '
+                             'tongue: raw MediaPipe 478 landmarks in crop '
+                             'space, the inner-lip subset (20 pts), ARKit '
+                             'jaw/mouth blendshapes (27 values), the 4x4 '
+                             'MediaPipe facial transform, and the SMIRK-driven '
+                             '3D FLAME MediaPipe landmarks (105 pts + 20-pt '
+                             'inner-mouth subset). Implies --crop and loads '
+                             'FLAME on the selected device.')
     parser.add_argument('--benchmark', action='store_true',
                         help='Measure and report per-stage timings + FPS.')
     parser.add_argument('--warmup', type=int, default=0,
@@ -172,6 +227,8 @@ def main():
     if args.with_eye_pose and not args.crop:
         # blendshape path requires per-frame mediapipe detection anyway.
         args.crop = True
+    if args.with_oral_features and not args.crop:
+        args.crop = True
 
     if args.out_path is None:
         stem = os.path.splitext(os.path.basename(args.input_path))[0]
@@ -183,6 +240,14 @@ def main():
 
     encoder = load_encoder(args.checkpoint, args.device)
 
+    # FLAME is only needed when --with_oral_features is requested (we call
+    # it to get 3D MediaPipe-embedded landmarks driven by SMIRK parameters).
+    flame = None
+    if args.with_oral_features:
+        from src.FLAME.FLAME import FLAME
+        flame = FLAME().to(args.device)
+        flame.eval()
+
     cap = cv2.VideoCapture(args.input_path)
     if not cap.isOpened():
         raise RuntimeError(f'Could not open video: {args.input_path}')
@@ -191,6 +256,7 @@ def main():
 
     per_frame_out: dict[int, dict[str, torch.Tensor]] = {}
     per_frame_eye: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    per_frame_oral: dict[int, dict[str, np.ndarray]] = {}
     valid_mask: list[bool] = []
 
     batch_imgs: list[np.ndarray] = []
@@ -218,6 +284,12 @@ def main():
         t_enc0 = time.perf_counter()
         with torch.no_grad():
             out = encoder(imgs_tensor)
+            # Run FLAME inside the same no_grad block so the 3D MediaPipe
+            # landmarks land on CPU for saving without autograd overhead.
+            flame_mp_3d = None
+            if flame is not None:
+                flame_out = flame.forward(out)
+                flame_mp_3d = flame_out['landmarks_mp'].detach().cpu().numpy()
         if args.device.startswith('cuda'):
             torch.cuda.synchronize()
         t_encode_total += time.perf_counter() - t_enc0
@@ -225,6 +297,8 @@ def main():
         cpu_out = {k: out[k].detach().cpu() for k in PARAM_DIMS}
         for row, src_idx in enumerate(batch_indices):
             per_frame_out[src_idx] = {k: cpu_out[k][row] for k in PARAM_DIMS}
+            if flame_mp_3d is not None and src_idx in per_frame_oral:
+                per_frame_oral[src_idx]['flame_landmarks_mp_3d'] = flame_mp_3d[row]
         batch_imgs.clear()
         batch_indices.clear()
 
@@ -253,10 +327,19 @@ def main():
             break
 
         if args.crop:
-            rgb_224, blendshapes, t_detect, t_warp = detect_and_crop(
-                frame, need_blendshapes=args.with_eye_pose,
-                mp_delegate=args.mp_delegate,
-            )
+            need_blendshapes = args.with_eye_pose or args.with_oral_features
+            if args.with_oral_features:
+                rgb_224, blendshapes, t_detect, t_warp, extras = detect_and_crop(
+                    frame, need_blendshapes=need_blendshapes,
+                    mp_delegate=args.mp_delegate,
+                    return_extras=True,
+                )
+            else:
+                rgb_224, blendshapes, t_detect, t_warp = detect_and_crop(
+                    frame, need_blendshapes=need_blendshapes,
+                    mp_delegate=args.mp_delegate,
+                )
+                extras = None
             t_detect_total += t_detect
             t_warp_total += t_warp
             if rgb_224 is None:
@@ -266,6 +349,7 @@ def main():
         else:
             rgb_224 = resize_only(frame)
             blendshapes = None
+            extras = None
 
         valid_mask.append(True)
         batch_imgs.append(rgb_224)
@@ -274,6 +358,29 @@ def main():
         if args.with_eye_pose:
             eyes_pose, eyelids = estimate_eye_pose_and_eyelid(blendshapes)
             per_frame_eye[frame_count] = (eyes_pose.squeeze(0), eyelids.squeeze(0))
+
+        if args.with_oral_features and extras is not None:
+            # Transform raw MP landmarks into crop space so 2D coords align
+            # with the 224x224 image SMIRK is encoding. The affine is the
+            # same one fast_crop_face_bgr applied to the pixels, so points
+            # and pixels stay in lockstep.
+            lmks_full = extras['landmarks_full']  # (478, 2), source-image px
+            crop_M = extras['crop_affine']        # (2, 3) or None
+            if crop_M is not None:
+                lmks_crop = apply_affine_2x3(lmks_full, crop_M).astype(np.float32)
+            else:
+                lmks_crop = lmks_full.astype(np.float32)
+            inner_mouth_2d = extract_inner_mouth_landmarks_2d(lmks_crop)
+            mouth_bs = extract_mouth_blendshapes(blendshapes)
+            transform = extras['transform']
+            if transform is None:
+                transform = np.eye(4, dtype=np.float32)
+            per_frame_oral[frame_count] = {
+                'mediapipe_landmarks_2d': lmks_crop,
+                'mediapipe_landmarks_inner_mouth_2d': inner_mouth_2d.astype(np.float32),
+                'mouth_blendshapes': mouth_bs,
+                'mediapipe_transform': transform.astype(np.float32),
+            }
 
         frame_count += 1
         if len(batch_imgs) >= args.batch_size:
@@ -319,6 +426,41 @@ def main():
         result['eyes_pose'] = torch.stack(eyes_pose_rows) if eyes_pose_rows else torch.zeros(0, 12)
         result['eyelids'] = torch.stack(eyelids_rows) if eyelids_rows else torch.zeros(0, 2)
 
+    if args.with_oral_features:
+        oral_keys_shape = {
+            'mediapipe_landmarks_2d': (478, 2),
+            'mediapipe_landmarks_inner_mouth_2d': (len(MP_INNER_MOUTH), 2),
+            'mouth_blendshapes': (len(ARKIT_MOUTH_KEYS),),
+            'mediapipe_transform': (4, 4),
+            'flame_landmarks_mp_3d': (105, 3),
+        }
+        for key, shape in oral_keys_shape.items():
+            rows = []
+            for idx in range(frame_count):
+                rec = per_frame_oral.get(idx)
+                if rec is not None and key in rec:
+                    rows.append(torch.from_numpy(np.asarray(rec[key], dtype=np.float32)))
+                else:
+                    rows.append(torch.zeros(*shape, dtype=torch.float32))
+            result[key] = torch.stack(rows) if rows else torch.zeros(0, *shape)
+        # Inner-mouth 3D subset is sliced from the FLAME 105-point tensor so
+        # the layout matches the 2D subset ordering exactly.
+        if result['flame_landmarks_mp_3d'].numel() > 0:
+            result['flame_landmarks_inner_mouth_3d'] = result['flame_landmarks_mp_3d'][
+                :, list(FLAME_MP_INNER_MOUTH), :
+            ].contiguous()
+        else:
+            result['flame_landmarks_inner_mouth_3d'] = torch.zeros(0, len(MP_INNER_MOUTH), 3)
+        # Index / metadata arrays (constant across frames; saved once so
+        # downstream code doesn't need to re-derive them).
+        result['mediapipe_inner_mouth_indices'] = torch.tensor(
+            list(MP_INNER_MOUTH), dtype=torch.long,
+        )
+        result['flame_mp_inner_mouth_positions'] = torch.tensor(
+            list(FLAME_MP_INNER_MOUTH), dtype=torch.long,
+        )
+        result['mouth_blendshape_names'] = list(ARKIT_MOUTH_KEYS)
+
     if args.benchmark:
         warmup_frames = args.warmup if warmup_done and args.warmup > 0 else 0
         bench_frames = max(0, frame_count - warmup_frames)
@@ -354,11 +496,18 @@ def main():
 
     ext = os.path.splitext(args.out_path)[1].lower()
     if ext == '.npz':
-        npz: dict[str, np.ndarray] = {
-            k: result[k].numpy() if isinstance(result[k], torch.Tensor) else np.array(result[k])
-            for k in result
-            if k != 'bench'
-        }
+        npz: dict[str, np.ndarray] = {}
+        for k, v in result.items():
+            if k == 'bench':
+                continue
+            if isinstance(v, torch.Tensor):
+                npz[k] = v.numpy()
+            elif isinstance(v, list) and v and isinstance(v[0], str):
+                # String arrays (e.g. mouth_blendshape_names) need dtype=object
+                # so numpy doesn't pad them to a fixed-width ascii dtype.
+                npz[k] = np.array(v, dtype=object)
+            else:
+                npz[k] = np.array(v)
         if 'bench' in result:
             for bk, bv in result['bench'].items():
                 npz[f'bench_{bk}'] = np.array(bv)
@@ -375,6 +524,13 @@ def main():
     if args.with_eye_pose:
         print(f'  eyes_pose:{tuple(result["eyes_pose"].shape)}  '
               f'eyelids:{tuple(result["eyelids"].shape)}')
+    if args.with_oral_features:
+        print(f'  mp_landmarks_2d:{tuple(result["mediapipe_landmarks_2d"].shape)}  '
+              f'inner_mouth_2d:{tuple(result["mediapipe_landmarks_inner_mouth_2d"].shape)}  '
+              f'mouth_bs:{tuple(result["mouth_blendshapes"].shape)}  '
+              f'mp_transform:{tuple(result["mediapipe_transform"].shape)}  '
+              f'flame_mp_3d:{tuple(result["flame_landmarks_mp_3d"].shape)}  '
+              f'inner_mouth_3d:{tuple(result["flame_landmarks_inner_mouth_3d"].shape)}')
     print(f'  valid frames: {int(result["valid_mask"].sum())}/{frame_count}')
 
 

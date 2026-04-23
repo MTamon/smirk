@@ -75,6 +75,14 @@ from utils.bbox_tracker import OnlineBBoxTracker
 from utils.face_crop import fast_crop_face_bgr
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
 from utils.eye_pose import estimate_eye_pose_and_eyelid
+from utils.oral_features import (
+    ARKIT_MOUTH_KEYS,
+    FLAME_MP_INNER_MOUTH,
+    MP_INNER_MOUTH,
+    apply_affine_2x3,
+    extract_inner_mouth_landmarks_2d,
+    extract_mouth_blendshapes,
+)
 from utils.vertex_viz import (
     add_vertex_viz_args,
     draw_vertex_points_bgr,
@@ -301,6 +309,18 @@ def main():
     parser.add_argument('--with_eye_pose', action='store_true',
                         help='Also estimate rot6d eyes_pose + blendshape '
                              'eyelids per frame via MediaPipe Tasks.')
+    parser.add_argument('--with_oral_features', action='store_true',
+                        help='Also log mouth-interior signals to the NDJSON '
+                             'save stream (only meaningful together with '
+                             '--save_path): raw MediaPipe 478 landmarks in '
+                             'crop space (float16-safe lists), the 20-pt '
+                             'inner-lip subset, 27 ARKit jaw/mouth '
+                             'blendshapes, the 4x4 MediaPipe facial '
+                             'transform, and SMIRK-driven 3D FLAME '
+                             'MediaPipe landmarks (105 pts + 20-pt subset). '
+                             'Uses run_mediapipe_full under the hood so it '
+                             'is slightly more expensive than the default '
+                             'landmark-only path.')
     parser.add_argument('--no_render', action='store_true',
                         help='Skip the FLAME mesh render (benchmark only).')
     parser.add_argument('--capture_only', action='store_true',
@@ -385,11 +405,15 @@ def main():
 
     flame = None
     renderer = None
-    if not args.no_render and not args.capture_only:
-        # Lazy import so benchmark mode works without FLAME assets.
+    need_flame = (not args.no_render and not args.capture_only) or (
+        args.with_oral_features and not args.capture_only
+    )
+    if need_flame:
+        # Lazy import so pure-benchmark mode works without FLAME assets.
         from src.FLAME.FLAME import FLAME
-        from src.renderer.renderer import Renderer
         flame = FLAME().to(device)
+    if not args.no_render and not args.capture_only:
+        from src.renderer.renderer import Renderer
         renderer = Renderer().to(device)
 
     # Resolve --source: integer → webcam, anything else → video file path.
@@ -464,6 +488,18 @@ def main():
     if args.save_path:
         os.makedirs(os.path.dirname(os.path.abspath(args.save_path)) or '.', exist_ok=True)
         save_fp = open(args.save_path, 'a', buffering=1)  # line-buffered
+        if args.with_oral_features:
+            # One-shot metadata line so consumers can align the per-frame
+            # inner-mouth subsets with the canonical index arrays without
+            # re-deriving them. Tagged with ``kind: meta`` so parsers that
+            # expect per-frame records can ignore it.
+            meta = {
+                'kind': 'meta',
+                'mediapipe_inner_mouth_indices': list(MP_INNER_MOUTH),
+                'flame_mp_inner_mouth_positions': list(FLAME_MP_INNER_MOUTH),
+                'mouth_blendshape_names': list(ARKIT_MOUTH_KEYS),
+            }
+            save_fp.write(json.dumps(meta) + '\n')
 
     os.makedirs(args.snapshot_dir, exist_ok=True)
 
@@ -529,11 +565,14 @@ def main():
             if not args.capture_only:
                 # --- MediaPipe ---
                 t_mp0 = time.perf_counter()
-                if args.with_eye_pose:
+                mp_transform = None
+                need_full_mp = args.with_eye_pose or args.with_oral_features
+                if need_full_mp:
                     mp_result = run_mediapipe_full(frame, delegate=args.mp_delegate)
                     if mp_result is not None:
                         landmarks = mp_result['landmarks'][..., :2]
                         blendshapes = mp_result['blendshapes']
+                        mp_transform = mp_result.get('transform')
                     else:
                         landmarks, blendshapes = None, None
                 else:
@@ -546,6 +585,7 @@ def main():
                 if face_ok:
                     # --- Preprocess (warp + cvtColor + to-device transfer) ---
                     t_pre0 = time.perf_counter()
+                    crop_affine = None
                     if bbox_tracker is not None:
                         # OnlineBBoxTracker returns a skimage similarity tform;
                         # slice its forward 3x3 .params to a 2x3 float32 matrix
@@ -553,6 +593,7 @@ def main():
                         # fast_crop_face_bgr's internal call).
                         tform, _, _ = bbox_tracker.update(landmarks)
                         M = tform.params[:2, :].astype(np.float32)
+                        crop_affine = M
                         cropped_bgr = cv2.warpAffine(
                             frame, M, (224, 224),
                             flags=cv2.INTER_LINEAR,
@@ -560,10 +601,14 @@ def main():
                             borderValue=(0, 0, 0),
                         )
                     else:
+                        _crop_M: list = []
                         cropped_bgr = fast_crop_face_bgr(
                             frame, landmarks,
                             scale=args.bbox_scale, image_size=224,
+                            matrix_out=_crop_M if args.with_oral_features else None,
                         )
+                        if _crop_M:
+                            crop_affine = _crop_M[0]
                     cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
                     tensor = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                     tensor = tensor.to(device, non_blocking=True)
@@ -604,10 +649,22 @@ def main():
                         eyelids_np = el.squeeze(0).numpy()
 
                     # --- Render (optional) ---
+                    flame_mp_3d_np = None
                     if not args.no_render:
                         t_ren0 = time.perf_counter()
                         mesh_img, ren_out = render_mesh(flame, renderer, outputs, device)
                         timings['ren'] = (time.perf_counter() - t_ren0) * 1000.0
+
+                    if args.with_oral_features and flame is not None:
+                        # Need 3D FLAME-driven MediaPipe landmarks for the
+                        # save record. The renderer also runs flame.forward
+                        # internally, but we keep this separate so --no_render
+                        # still produces the feature.
+                        with torch.no_grad():
+                            flame_out_oral = flame.forward(outputs)
+                        flame_mp_3d_np = (
+                            flame_out_oral['landmarks_mp'].detach().cpu().numpy().squeeze(0)
+                        )
 
                     if save_fp is not None:
                         record = {
@@ -622,6 +679,28 @@ def main():
                         if args.with_eye_pose and eyes_pose_np is not None:
                             record['eyes_pose'] = eyes_pose_np.tolist()
                             record['eyelids'] = eyelids_np.tolist()
+                        if args.with_oral_features:
+                            if crop_affine is not None:
+                                lmks_crop = apply_affine_2x3(landmarks, crop_affine)
+                            else:
+                                lmks_crop = np.asarray(landmarks, dtype=np.float32)
+                            inner_mouth_2d = extract_inner_mouth_landmarks_2d(lmks_crop)
+                            mouth_bs = extract_mouth_blendshapes(blendshapes)
+                            transform = (
+                                mp_transform if mp_transform is not None
+                                else np.eye(4, dtype=np.float32)
+                            )
+                            record['mediapipe_landmarks_2d'] = lmks_crop.astype(np.float32).tolist()
+                            record['mediapipe_landmarks_inner_mouth_2d'] = (
+                                inner_mouth_2d.astype(np.float32).tolist()
+                            )
+                            record['mouth_blendshapes'] = mouth_bs.tolist()
+                            record['mediapipe_transform'] = transform.astype(np.float32).tolist()
+                            if flame_mp_3d_np is not None:
+                                record['flame_landmarks_mp_3d'] = flame_mp_3d_np.tolist()
+                                record['flame_landmarks_inner_mouth_3d'] = (
+                                    flame_mp_3d_np[list(FLAME_MP_INNER_MOUTH), :].tolist()
+                                )
                         save_fp.write(json.dumps(record) + '\n')
 
             # --- Display prep (resize + hstack + overlay) ---

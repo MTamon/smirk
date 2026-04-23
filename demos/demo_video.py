@@ -14,7 +14,14 @@ from src.FLAME.FLAME import FLAME
 from src.renderer.renderer import Renderer
 import argparse
 import src.utils.masking as masking_utils
-from utils.mediapipe_utils import run_mediapipe
+from utils.mediapipe_utils import run_mediapipe, run_mediapipe_full
+from utils.oral_features import (
+    ARKIT_MOUTH_KEYS,
+    FLAME_MP_INNER_MOUTH,
+    MP_INNER_MOUTH,
+    extract_inner_mouth_landmarks_2d,
+    extract_mouth_blendshapes,
+)
 from utils.bbox_tracker import (
     OnlineBBoxTracker,
     build_similarity_tform,
@@ -129,6 +136,16 @@ if __name__ == '__main__':
     parser.add_argument('--freeze_shape_warmup_frames', type=int, default=45,
                         help='Warm-up length (frames) for --freeze_shape in online '
                              'mode. Default 45 (≈1.5 s at 30 fps).')
+    parser.add_argument('--oral_features_path', type=str, default=None,
+                        help='If set, write a single .pt file containing mouth-'
+                             'interior features alongside the rendered mp4: raw '
+                             'MediaPipe 478 landmarks in crop space, the 20-pt '
+                             'inner-lip subset, 27 ARKit jaw/mouth blendshapes, '
+                             'the 4x4 MediaPipe facial transform, and SMIRK-driven '
+                             '3D FLAME MediaPipe landmarks (105 pts + 20-pt '
+                             'subset). Forces run_mediapipe_full per frame so '
+                             'blendshapes are available; adds ~1-2 ms / frame on '
+                             'CPU delegate.')
 
     args = parser.parse_args()
 
@@ -292,21 +309,36 @@ if __name__ == '__main__':
             shape_buffer = []
 
     frame_idx = 0
+    oral_feature_rows: list[dict] = [] if args.oral_features_path else []
 
     while True:
         ret, image = cap.read()
 
         if not ret:
             break
-    
-        kpt_mediapipe = run_mediapipe(image)
+
+        mouth_bs_np = None
+        mp_transform_np = None
+        if args.oral_features_path:
+            mp_full = run_mediapipe_full(image)
+            if mp_full is None:
+                kpt_mediapipe = None
+            else:
+                kpt_mediapipe = mp_full['landmarks']
+                mouth_bs_np = extract_mouth_blendshapes(mp_full.get('blendshapes'))
+                mp_transform_np = (
+                    mp_full['transform'] if mp_full.get('transform') is not None
+                    else np.eye(4, dtype=np.float32)
+                )
+        else:
+            kpt_mediapipe = run_mediapipe(image)
 
         # crop face if needed
         if args.crop:
             if (kpt_mediapipe is None):
                 print('Could not find landmarks for the image using mediapipe and cannot crop the face. Exiting...')
                 exit()
-            
+
             kpt_mediapipe = kpt_mediapipe[..., :2]
 
             if args.bbox_mode == 'offline':
@@ -351,6 +383,31 @@ if __name__ == '__main__':
                                             landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
 
         rendered_img = renderer_output['rendered_img']
+
+        if args.oral_features_path:
+            # cropped_kpt_mediapipe is in crop (224x224) coordinates when
+            # --crop is set, otherwise source-image coordinates. Either way
+            # it matches the frame SMIRK encoded so inner-mouth points align
+            # with the rendered output.
+            lmks_crop = np.asarray(cropped_kpt_mediapipe, dtype=np.float32)
+            inner_mouth_2d = extract_inner_mouth_landmarks_2d(lmks_crop).astype(np.float32)
+            flame_mp_3d = flame_output['landmarks_mp'].detach().cpu().numpy().squeeze(0)
+            inner_mouth_3d = flame_mp_3d[list(FLAME_MP_INNER_MOUTH), :]
+            oral_feature_rows.append({
+                'frame': frame_idx,
+                'mediapipe_landmarks_2d': lmks_crop,
+                'mediapipe_landmarks_inner_mouth_2d': inner_mouth_2d,
+                'mouth_blendshapes': (
+                    mouth_bs_np if mouth_bs_np is not None
+                    else np.zeros(len(ARKIT_MOUTH_KEYS), dtype=np.float32)
+                ),
+                'mediapipe_transform': (
+                    mp_transform_np if mp_transform_np is not None
+                    else np.eye(4, dtype=np.float32)
+                ),
+                'flame_landmarks_mp_3d': flame_mp_3d.astype(np.float32),
+                'flame_landmarks_inner_mouth_3d': inner_mouth_3d.astype(np.float32),
+            })
 
         if args.render_orig:
             if args.crop:
@@ -457,5 +514,39 @@ if __name__ == '__main__':
 
     cap.release()
     cap_out.release()
+
+    if args.oral_features_path:
+        os.makedirs(
+            os.path.dirname(os.path.abspath(args.oral_features_path)) or '.',
+            exist_ok=True,
+        )
+        # Stack per-frame arrays into (T, *) tensors. Each row was allocated
+        # with a fixed shape above, so stacking is a straight np.stack.
+        stacked: dict[str, torch.Tensor] = {}
+        keys = [
+            'mediapipe_landmarks_2d',
+            'mediapipe_landmarks_inner_mouth_2d',
+            'mouth_blendshapes',
+            'mediapipe_transform',
+            'flame_landmarks_mp_3d',
+            'flame_landmarks_inner_mouth_3d',
+        ]
+        for k in keys:
+            if oral_feature_rows:
+                arr = np.stack([row[k] for row in oral_feature_rows], axis=0)
+                stacked[k] = torch.from_numpy(arr)
+            else:
+                stacked[k] = torch.zeros(0)
+        stacked['num_frames'] = len(oral_feature_rows)
+        stacked['mediapipe_inner_mouth_indices'] = torch.tensor(
+            list(MP_INNER_MOUTH), dtype=torch.long,
+        )
+        stacked['flame_mp_inner_mouth_positions'] = torch.tensor(
+            list(FLAME_MP_INNER_MOUTH), dtype=torch.long,
+        )
+        stacked['mouth_blendshape_names'] = list(ARKIT_MOUTH_KEYS)
+        torch.save(stacked, args.oral_features_path)
+        print(f'[demo_video] wrote oral features ({len(oral_feature_rows)} frames) '
+              f'to {args.oral_features_path}')
 
 
